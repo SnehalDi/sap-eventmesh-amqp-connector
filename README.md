@@ -135,7 +135,7 @@ sap.tokenUrl=https://your-subdomain.authentication.eu20.hana.ondemand.com/oauth/
     
     <sap-amqp:publish-message 
         config-ref="SAP_Event_Mesh_Config" 
-        queueName="TRANSFORM/S4HANA/TEST/S4TEST">
+        queueName="your-queuename">
         <sap-amqp:message-payload>
             <![CDATA[#[%dw 2.0
                 output application/json
@@ -159,7 +159,7 @@ sap.tokenUrl=https://your-subdomain.authentication.eu20.hana.ondemand.com/oauth/
 <flow name="message-listener-flow">
     <sap-amqp:listener 
         config-ref="SAP_Event_Mesh_Config"
-        queueName="TRANSFORM/S4HANA/TEST/S4TEST"
+        queueName="your-queuename"
         numberOfConsumers="2"
         ackMode="AUTO">
     </sap-amqp:listener>
@@ -183,7 +183,7 @@ sap.tokenUrl=https://your-subdomain.authentication.eu20.hana.ondemand.com/oauth/
     
     <sap-amqp:consume-message 
         config-ref="SAP_Event_Mesh_Config"
-        queueName="TRANSFORM/S4HANA/TEST/S4TEST"
+        queueName="your-queuename"
         timeout="5000"/>
     
     <choice>
