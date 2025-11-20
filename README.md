@@ -51,7 +51,7 @@ SAP Event Mesh Queue/Topic
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/NimraZafar0802/sap-eventmesh-amqp-connector.git
+git clone https://github.com/nimrazafar/sap-eventmesh-amqp-connector.git
 cd sap-eventmesh-amqp-connector
 ```
 
