@@ -42,7 +42,7 @@ SAP Event Mesh Queue/Topic
 
 - **Anypoint Studio**: 7.15 or higher
 - **Mule Runtime**: 4.4.0 or higher
-- **Java**: JDK 8 or higher (JDK 17 tested)
+- **Java**: JDK 8 or higher 
 - **Maven**: 3.6.0 or higher
 - **SAP BTP Account**: With Event Mesh service instance
 
