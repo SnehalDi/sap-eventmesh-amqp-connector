@@ -319,7 +319,7 @@ Provides message listener capability with multi-threaded consumers.
 | `tokenUrl` | OAuth2 token endpoint | Yes | `https://subdomain.authentication.eu20.hana.ondemand.com/oauth/token` |
 | `clientId` | OAuth2 client ID | Yes | `sb-clone-xbem-service-...` |
 | `clientSecret` | OAuth2 client secret | Yes | `********` |
-| `queueName` | Destination queue name | Yes | `TRANSFORM/S4HANA/TEST/S4TEST` |
+| `queueName` | Destination queue name | Yes | `your-queuename` |
 | `numberOfConsumers` | Concurrent consumers | No (default: 1) | `2` |
 | `ackMode` | Acknowledgment mode | No (default: AUTO) | `AUTO`, `CLIENT`, `DUPS_OK` |
 | `timeout` | Consume timeout (ms) | No (default: 5000) | `10000` |
