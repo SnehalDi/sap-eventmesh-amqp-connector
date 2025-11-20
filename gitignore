@@ -1,0 +1,119 @@
+# Maven
+target/
+pom.xml.tag
+pom.xml.releaseBackup
+pom.xml.versionsBackup
+pom.xml.next
+release.properties
+dependency-reduced-pom.xml
+buildNumber.properties
+.mvn/timing.properties
+.mvn/wrapper/maven-wrapper.jar
+
+# MuleSoft/Anypoint Studio
+.mule/
+.studio/
+.settings/
+.classpath
+.project
+*.bak
+*.swp
+.metadata/
+.mule-plugins/
+
+# IDEs
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+*.code-workspace
+
+# Eclipse
+.classpath
+.project
+.settings/
+
+# NetBeans
+nbproject/private/
+build/
+nbbuild/
+dist/
+nbdist/
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+*~
+
+# Logs
+*.log
+logs/
+*.log.*
+
+# Credentials and Sensitive Data (IMPORTANT!)
+*.properties
+!example.properties
+!pom.properties
+*.yaml
+!example.yaml
+*.yml
+!example.yml
+*.env
+.env*
+*-secrets.json
+credentials.json
+serviceAccountKey.json
+
+# Temporary files
+*.tmp
+*.temp
+temp/
+tmp/
+
+# Test files
+*.class
+*.jar
+!gradle-wrapper.jar
+*.war
+*.ear
+*.zip
+*.tar.gz
+*.rar
+
+# Java
+hs_err_pid*
+replay_pid*
+
+# Build artifacts
+bin/
+out/
+build/
+generated/
+.gradle/
+
+# Package files
+*.jar
+*.war
+*.nar
+*.ear
+*.zip
+*.tar.gz
+*.rar
+
+# Backup files
+*.orig
+
+# Configuration overrides
+local.properties
+override.properties
+
+# SAP specific
+*-service-key.json
+*-credentials.json
+sap-*.json
