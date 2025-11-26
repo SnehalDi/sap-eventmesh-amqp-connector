@@ -1,6 +1,7 @@
 package com.mycompany.mule.connectors.sapAMQPConnector.internal;
 
 import static org.mule.runtime.extension.api.annotation.param.MediaType.ANY;
+import java.nio.charset.StandardCharsets;
 import org.mule.runtime.extension.api.annotation.param.MediaType;
 import org.mule.runtime.extension.api.annotation.param.Config;
 import org.mule.runtime.extension.api.annotation.param.Connection;
@@ -115,7 +116,7 @@ public class SapAmqpConnectorOperations {
                 }
                 
                 // URL encode the Bearer token for the Authorization header
-                String encodedToken = URLEncoder.encode("Bearer " + accessToken, "UTF-8");
+                String encodedToken = URLEncoder.encode("Bearer " + accessToken, StandardCharsets.UTF_8);
                 
                 // Build connection URL with Authorization header
                 connectionUrl = String.format(
