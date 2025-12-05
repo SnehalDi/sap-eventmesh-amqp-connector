@@ -1,7 +1,9 @@
 package com.mycompany.mule.connectors.sapAMQPConnector.internal;
 
 import static org.mule.runtime.extension.api.annotation.param.MediaType.ANY;
+import java.nio.charset.StandardCharsets;
 import org.mule.runtime.extension.api.annotation.param.MediaType;
+import org.mule.runtime.extension.api.annotation.param.NullSafe;
 import org.mule.runtime.extension.api.annotation.param.Config;
 import org.mule.runtime.extension.api.annotation.param.Connection;
 import org.mule.runtime.extension.api.annotation.param.Content;
@@ -9,15 +11,16 @@ import org.mule.runtime.extension.api.annotation.param.Optional;
 import org.mule.runtime.extension.api.annotation.param.display.DisplayName;
 import org.mule.runtime.extension.api.annotation.param.display.Summary;
 
-import javax.jms.ConnectionFactory;
-import javax.jms.Session;
-import javax.jms.Destination;
-import javax.jms.MessageProducer;
-import javax.jms.MessageConsumer;
-import javax.jms.TextMessage;
-import javax.jms.Message;
-import javax.jms.BytesMessage;
-import javax.jms.ObjectMessage;
+import jakarta.jms.ConnectionFactory;
+import jakarta.jms.Session;
+import jakarta.jms.Destination;
+import jakarta.jms.MessageProducer;
+import jakarta.jms.MessageConsumer;
+import jakarta.jms.TextMessage;
+import jakarta.jms.Message;
+import jakarta.jms.BytesMessage;
+import jakarta.jms.ObjectMessage;
+import jakarta.jms.JMSException;
 import org.apache.qpid.jms.JmsConnectionFactory;
 
 import org.mule.runtime.api.connection.ConnectionException;
@@ -47,20 +50,23 @@ import java.net.URLEncoder;
 import java.io.InputStream;
 
 
+
 public class SapAmqpConnectorOperations {
 
     private final Logger LOGGER = LoggerFactory.getLogger(SapAmqpConnectorOperations.class);
     private final ObjectMapper objectMapper = new ObjectMapper();
 
-    @DisplayName("Publish Message")
+    @DisplayName("Publish")
     @MediaType(value = ANY, strict = false)
     public void publishMessage(
             @Config SapAmqpConnectorConfiguration config,
             @Connection SapAmqpConnectorConnection connection,
             @DisplayName("Queue Name") @Summary("Name of the queue to publish to") String queueName,
-            @Content @DisplayName("Message Payload") Object payload) throws ConnectionException {
+            @Content @DisplayName("Message Payload") Object payload,
+            @Optional @DisplayName("Headers") @Summary("Custom headers to add to the message") 
+            @NullSafe List<MessageHeader> headers) throws ConnectionException {
 
-        javax.jms.Connection jmsConnection = null;
+        jakarta.jms.Connection jmsConnection = null;
         Session session = null;
         MessageProducer producer = null;
 
@@ -71,17 +77,28 @@ public class SapAmqpConnectorOperations {
             String messagePayload = convertPayloadToString(payload);
             LOGGER.info("Message payload converted to String (length: {})", messagePayload.length());
 
-            // --- Fetch or Reuse Access Token ---
-            String accessToken = connection.getAccessToken();
-            if (accessToken == null) {
-                LOGGER.info("No valid token found, fetching new token...");
-                accessToken = fetchNewAccessToken(config);
-                connection.setAccessToken(accessToken, 3600);
+            // --- Get Access Token from Headers ---
+            String accessToken = null;
+            MessageHeader authHeader = null;
+            
+            if (headers != null) {
+                for (MessageHeader header : headers) {
+                    if (header.getKey() != null) {
+                        String key = header.getKey().trim();
+                        if ("Authorization".equalsIgnoreCase(key)) {
+                            accessToken = header.getValue();
+                            authHeader = header;
+                            LOGGER.debug("Using {} token from headers", key);
+                            break;
+                        }
+                    }
+                }
             }
-
+      
             if (accessToken == null || accessToken.trim().isEmpty()) {
-                throw new ConnectionException("Failed to obtain access token.");
+                throw new ConnectionException("Authorization token must be provided in headers.");
             }
+            
             LOGGER.debug("Using OAuth2 access token for authentication");
 
             // --- Build AMQP WebSocket Connection URL with Explicit Port ---
@@ -115,7 +132,7 @@ public class SapAmqpConnectorOperations {
                 }
                 
                 // URL encode the Bearer token for the Authorization header
-                String encodedToken = URLEncoder.encode("Bearer " + accessToken, "UTF-8");
+                String encodedToken = URLEncoder.encode("Bearer " + accessToken, StandardCharsets.UTF_8);
                 
                 // Build connection URL with Authorization header
                 connectionUrl = String.format(
@@ -144,7 +161,7 @@ public class SapAmqpConnectorOperations {
             jmsConnection = factory.createConnection();
             connection.setJmsConnection(jmsConnection);
             jmsConnection.start();
-            LOGGER.info("✅ JMS Connection started successfully");
+            LOGGER.info("JMS Connection started successfully");
 
             // --- Create Session and Send Message ---
             session = jmsConnection.createSession(false, Session.AUTO_ACKNOWLEDGE);
@@ -157,10 +174,38 @@ public class SapAmqpConnectorOperations {
             LOGGER.debug("Message Producer created");
 
             TextMessage msg = session.createTextMessage(messagePayload);
+            
+            // --- Add Custom Headers to JMS Message (excluding Authorization) ---
+            if (headers != null && !headers.isEmpty()) {
+                int headerCount = 0;
+                for (MessageHeader header : headers) {
+                    // Skip the authorization header
+                    if (header == authHeader) {
+                        continue;
+                    }
+                    
+                    String headerName = header.getKey();
+                    String headerValue = header.getValue();
+                    
+                    if (headerName != null && !headerName.trim().isEmpty()) {
+                        try {
+                            msg.setStringProperty(headerName.trim(), headerValue);
+                            headerCount++;
+                            LOGGER.debug("Added header: {} = {}", headerName, headerValue);
+                        } catch (JMSException e) {
+                            LOGGER.warn("Failed to set header '{}': {}", headerName, e.getMessage());
+                        }
+                    }
+                }
+                if (headerCount > 0) {
+                    LOGGER.debug("Added {} custom headers to message", headerCount);
+                }
+            }
+            
             producer.send(msg);
-            LOGGER.info("✅ Successfully published message to queue: {}", queueName);
+            LOGGER.info("Successfully published message to queue: {}", queueName);
 
-        } catch (javax.jms.JMSException e) {
+        } catch (JMSException e) {
             String errorMessage = (e.getMessage() != null) ? e.getMessage().toLowerCase() : "";
             LOGGER.error("JMS Error: {}", e.getMessage());
             
@@ -169,8 +214,8 @@ public class SapAmqpConnectorOperations {
                 errorMessage.contains("authentication failed") || 
                 errorMessage.contains("forbidden") || 
                 errorMessage.contains("security exception")) {
-                LOGGER.warn("❌ Authentication failed - invalidating token");
-                connection.setAccessToken(null, 0);
+                LOGGER.warn("Authentication failed - invalidating token");
+                connection.clearToken();
                 throw new ConnectionException("Authentication failed: " + e.getMessage(), e);
             } else {
                 LOGGER.error("JMSException occurred", e);
@@ -186,12 +231,12 @@ public class SapAmqpConnectorOperations {
             LOGGER.debug("Closing JMS resources...");
             try { 
                 if (producer != null) producer.close(); 
-            } catch (javax.jms.JMSException e) { 
+            } catch (JMSException e) { 
                 LOGGER.error("Error closing producer", e); 
             }
             try { 
                 if (session != null) session.close(); 
-            } catch (javax.jms.JMSException e) { 
+            } catch (JMSException e) { 
                 LOGGER.error("Error closing session", e); 
             }
             try { 
@@ -207,7 +252,7 @@ public class SapAmqpConnectorOperations {
      * Consume Message Operation - Synchronously receives one message from the queue
      * Returns JSON string with message details
      */
-    @DisplayName("Consume Message")
+    @DisplayName("Consume")
     @MediaType(value = ANY, strict = false)
     @Summary("Synchronously consume a single message from SAP Event Mesh queue")
     public String consumeMessage(
@@ -218,25 +263,35 @@ public class SapAmqpConnectorOperations {
             String queueName,
             @Optional(defaultValue = "5000") @DisplayName("Timeout (ms)") 
             @Summary("Time to wait for a message in milliseconds (default: 5000ms)") 
-            long timeout) {
+            long timeout,
+            @Optional @DisplayName("Headers") @Summary("Custom headers including Authorization token") 
+            @NullSafe List<MessageHeader> headers) {
 
-        javax.jms.Connection jmsConnection = null;
+        jakarta.jms.Connection jmsConnection = null;
         Session session = null;
         MessageConsumer consumer = null;
 
         try {
             LOGGER.info("=== Starting SAP Event Mesh Message Consumption ===");
 
-            // --- Fetch or Reuse Access Token ---
-            String accessToken = connection.getAccessToken();
-            if (accessToken == null) {
-                LOGGER.info("No valid token found, fetching new token...");
-                accessToken = fetchNewAccessToken(config);
-                connection.setAccessToken(accessToken, 3600);
+            // --- Get Access Token from Headers ---
+            String accessToken = null;
+            
+            if (headers != null) {
+                for (MessageHeader header : headers) {
+                    if (header.getKey() != null) {
+                        String key = header.getKey().trim();
+                        if ("Authorization".equalsIgnoreCase(key)) {
+                            accessToken = header.getValue();
+                            LOGGER.debug("Using {} token from headers", key);
+                            break;
+                        }
+                    }
+                }
             }
 
             if (accessToken == null || accessToken.trim().isEmpty()) {
-                return buildErrorResponse("AUTHENTICATION_ERROR", "Failed to obtain access token");
+                return buildErrorResponse("AUTHENTICATION_ERROR", "Authorization token must be provided in headers");
             }
             LOGGER.debug("Using OAuth2 access token for authentication");
 
@@ -254,14 +309,14 @@ public class SapAmqpConnectorOperations {
             jmsConnection = factory.createConnection();
             connection.setJmsConnection(jmsConnection);
             jmsConnection.start();
-            LOGGER.info("✅ JMS Connection started successfully");
+            LOGGER.info("JMS Connection started successfully");
 
             // --- Create Session and Consumer ---
             session = jmsConnection.createSession(false, Session.AUTO_ACKNOWLEDGE);
             LOGGER.debug("JMS Session created");
             
-            Destination queue = session.createQueue(queueName );
-            LOGGER.debug("Destination queue: {}",queueName );
+            Destination queue = session.createQueue(queueName);
+            LOGGER.debug("Destination queue: {}", queueName);
             
             consumer = session.createConsumer(queue);
             LOGGER.debug("Message Consumer created");
@@ -271,7 +326,7 @@ public class SapAmqpConnectorOperations {
             Message message = consumer.receive(timeout);
 
             if (message == null) {
-                LOGGER.warn("⚠️ No message received within timeout period");
+                LOGGER.warn("No message received within timeout period");
                 Map<String, Object> result = new HashMap<>();
                 result.put("status", "NO_MESSAGE");
                 result.put("message", "No message available in queue within timeout period");
@@ -280,7 +335,7 @@ public class SapAmqpConnectorOperations {
             }
 
             // --- Extract Message Details ---
-            LOGGER.info("✅ Message received from queue");
+            LOGGER.info("Message received from queue");
             
             String payload = extractPayload(message);
             Map<String, Object> attributes = extractAttributes(message);
@@ -300,10 +355,10 @@ public class SapAmqpConnectorOperations {
             result.put("priority", attributes.get("priority"));
             result.put("allAttributes", attributes);
 
-            LOGGER.info("✅ Successfully consumed message from queue: {}", queueName);
+            LOGGER.info("Successfully consumed message from queue: {}", queueName);
             return objectMapper.writeValueAsString(result);
 
-        } catch (javax.jms.JMSException e) {
+        } catch (JMSException e) {
             String errorMessage = (e.getMessage() != null) ? e.getMessage().toLowerCase() : "";
             LOGGER.error("JMS Error: {}", e.getMessage());
             
@@ -312,8 +367,8 @@ public class SapAmqpConnectorOperations {
                 errorMessage.contains("authentication failed") || 
                 errorMessage.contains("forbidden") || 
                 errorMessage.contains("security exception")) {
-                LOGGER.warn("❌ Authentication failed - invalidating token");
-                connection.setAccessToken(null, 0);
+                LOGGER.warn("Authentication failed - invalidating token");
+                connection.clearToken();
                 return buildErrorResponse("AUTHENTICATION_ERROR", "Authentication failed: " + e.getMessage());
             } else {
                 LOGGER.error("JMSException occurred", e);
@@ -326,12 +381,12 @@ public class SapAmqpConnectorOperations {
             LOGGER.debug("Closing JMS resources...");
             try { 
                 if (consumer != null) consumer.close(); 
-            } catch (javax.jms.JMSException e) { 
+            } catch (JMSException e) { 
                 LOGGER.error("Error closing consumer", e); 
             }
             try { 
                 if (session != null) session.close(); 
-            } catch (javax.jms.JMSException e) { 
+            } catch (JMSException e) { 
                 LOGGER.error("Error closing session", e); 
             }
             try { 
@@ -501,56 +556,4 @@ public class SapAmqpConnectorOperations {
         }
         buffer.flush();
         return buffer.toByteArray();
-    }
-
-    /**
-     * Fetches a new OAuth2 access token from SAP Event Mesh token endpoint
-     */
-    private String fetchNewAccessToken(SapAmqpConnectorConfiguration config) throws ConnectionException {
-        LOGGER.debug("Fetching OAuth2 token...");
-        CloseableHttpClient httpClient = HttpClients.createDefault();
-        HttpPost httpPost = new HttpPost(config.getTokenUrl());
-
-        try {
-            String auth = config.getClientId() + ":" + config.getClientSecret();
-            String encodedAuth = Base64.getEncoder().encodeToString(auth.getBytes());
-            httpPost.setHeader("Authorization", "Basic " + encodedAuth);
-            httpPost.setHeader("Content-Type", "application/x-www-form-urlencoded");
-
-            List<NameValuePair> params = new ArrayList<>();
-            params.add(new BasicNameValuePair("grant_type", "client_credentials"));
-            httpPost.setEntity(new UrlEncodedFormEntity(params));
-
-            LOGGER.debug("Token request to: {}", config.getTokenUrl());
-            HttpResponse response = httpClient.execute(httpPost);
-            HttpEntity entity = response.getEntity();
-            int statusCode = response.getStatusLine().getStatusCode();
-
-            if (statusCode >= 200 && statusCode < 300) {
-                String responseBody = EntityUtils.toString(entity);
-                
-                JsonNode jsonNode = objectMapper.readTree(responseBody);
-                if (jsonNode.has("access_token")) {
-                    String token = jsonNode.get("access_token").asText();
-                    LOGGER.info("✅ Successfully fetched OAuth2 token");
-                    return token;
-                } else {
-                    throw new ConnectionException("Access token not found in response");
-                }
-            } else {
-                String errorBody = EntityUtils.toString(entity);
-                LOGGER.error("Token fetch failed - Status: {}, Body: {}", statusCode, errorBody);
-                throw new ConnectionException("Failed to fetch token. Status: " + statusCode);
-            }
-        } catch (Exception e) {
-            LOGGER.error("Error during token fetch", e);
-            throw new ConnectionException("Error fetching token: " + e.getMessage(), e);
-        } finally {
-            try {
-                httpClient.close();
-            } catch (Exception e) {
-                LOGGER.error("Error closing HTTP client", e);
-            }
-        }
-    }
-}
+    }}
