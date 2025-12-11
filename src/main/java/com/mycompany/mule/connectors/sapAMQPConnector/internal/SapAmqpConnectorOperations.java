@@ -10,6 +10,10 @@ import org.mule.runtime.extension.api.annotation.param.Content;
 import org.mule.runtime.extension.api.annotation.param.Optional;
 import org.mule.runtime.extension.api.annotation.param.display.DisplayName;
 import org.mule.runtime.extension.api.annotation.param.display.Summary;
+import org.mule.runtime.extension.api.runtime.operation.Result;
+import org.mule.runtime.api.metadata.TypedValue;
+import org.mule.runtime.api.metadata.DataType;
+import org.mule.runtime.extension.api.annotation.metadata.OutputResolver;
 
 import jakarta.jms.*;
 import org.apache.qpid.jms.JmsConnectionFactory;
@@ -30,6 +34,9 @@ public class SapAmqpConnectorOperations {
 
     private final Logger LOGGER = LoggerFactory.getLogger(SapAmqpConnectorOperations.class);
     private final ObjectMapper objectMapper = new ObjectMapper();
+    
+    // JMS property key for AMQP content-type
+    private static final String JMS_AMQP_CONTENT_TYPE = "JMS_AMQP_CONTENT_TYPE";
 
     @DisplayName("Publish")
     @MediaType(value = ANY, strict = false)
@@ -37,7 +44,7 @@ public class SapAmqpConnectorOperations {
             @Config SapAmqpConnectorConfiguration config,
             @Connection SapAmqpConnectorConnection connection,
             @DisplayName("Queue Name") @Summary("Name of the queue to publish to") String queueName,
-            @Content @DisplayName("Message Payload") Object payload,
+            @Content @DisplayName("Message Payload") TypedValue<Object> payload,
             @Optional @DisplayName("Headers") @Summary("Custom headers to add to the message") 
             @NullSafe List<MessageHeader> headers) throws ConnectionException {
 
@@ -54,9 +61,16 @@ public class SapAmqpConnectorOperations {
                 throw new ConnectionException("Authorization token must be provided in headers.");
             }
 
-            // Convert payload to string
-            String messagePayload = convertPayloadToString(payload);
-            LOGGER.info("Message payload converted to String (length: {})", messagePayload.length());
+            // Extract MIME type information
+            DataType dataType = payload.getDataType();
+            org.mule.runtime.api.metadata.MediaType mediaType = dataType.getMediaType();
+            String mimeType = mediaType.toRfcString();
+            
+            LOGGER.info("Payload MIME type: {}", mimeType);
+
+            // Convert payload to byte array to preserve exact content
+            byte[] messageBytes = convertPayloadToBytes(payload.getValue());
+            LOGGER.info("Message payload converted to bytes (length: {})", messageBytes.length);
 
             // Create and start JMS connection
             jmsConnection = createJmsConnection(config, accessToken, connection);
@@ -67,12 +81,20 @@ public class SapAmqpConnectorOperations {
             producer = session.createProducer(queue);
             LOGGER.debug("Message Producer created for queue: {}", queueName);
 
-            // Create and send message
-            TextMessage msg = session.createTextMessage(messagePayload);
+            // Create BytesMessage to preserve content exactly as-is
+            BytesMessage msg = session.createBytesMessage();
+            msg.writeBytes(messageBytes);
+            
+            // Set AMQP content-type property (standard AMQP 1.0 property via Qpid JMS)
+            msg.setStringProperty(JMS_AMQP_CONTENT_TYPE, mimeType);
+            LOGGER.debug("Set AMQP content-type property: {}", mimeType);
+            
+            // Add custom headers
             addCustomHeaders(msg, headers);
+            
             producer.send(msg);
             
-            LOGGER.info("Successfully published message to queue: {}", queueName);
+            LOGGER.info("Successfully published message to queue: {} with content-type: {}", queueName, mimeType);
 
         } catch (JMSException e) {
             handleJmsException(e, connection);
@@ -90,7 +112,8 @@ public class SapAmqpConnectorOperations {
     @DisplayName("Consume")
     @MediaType(value = ANY, strict = false)
     @Summary("Synchronously consume a single message from SAP Event Mesh queue")
-    public String consumeMessage(
+    @OutputResolver(output = SapAmqpOutputResolver.class)
+    public Result<Object, MessageAttributes> consumeMessage(
             @Config SapAmqpConnectorConfiguration config,
             @Connection SapAmqpConnectorConnection connection,
             @DisplayName("Queue Name") @Summary("Name of the queue to consume from") String queueName,
@@ -109,7 +132,7 @@ public class SapAmqpConnectorOperations {
             // Extract and validate access token
             String accessToken = extractAccessToken(headers);
             if (accessToken == null || accessToken.trim().isEmpty()) {
-                return buildErrorResponse("AUTHENTICATION_ERROR", "Authorization token must be provided in headers");
+                return buildErrorResult("AUTHENTICATION_ERROR", "Authorization token must be provided in headers");
             }
 
             // Create and start JMS connection
@@ -127,23 +150,39 @@ public class SapAmqpConnectorOperations {
 
             if (message == null) {
                 LOGGER.warn("No message received within timeout period");
-                return buildNoMessageResponse(timeout);
+                return buildNoMessageResult(timeout);
             }
 
-            // Extract message details and build response
+            // Extract message details 
             LOGGER.info("Message received from queue");
-            String payloadStr = extractPayload(message);
-            Map<String, Object> attributes = extractAttributes(message);
+            byte[] payloadBytes = extractPayloadAsBytes(message);
+            MessageAttributes attributes = extractMessageAttributes(message);
             
-            LOGGER.info("Message ID: {}, Type: {}", attributes.get("messageId"), attributes.get("messageType"));
+            // Extract and parse MIME type from JMS properties
+            org.mule.runtime.api.metadata.MediaType outputMediaType = extractMediaType(message);
             
-            return buildSuccessResponse(payloadStr, attributes);
+            LOGGER.info("custom contentType: {}", message.getStringProperty("contentType"));
+            LOGGER.info("contentType: {}", message.getStringProperty("JMS_AMQP_ContentType"));
+;           LOGGER.info("JMSX contentType: {}", message.getStringProperty("JMSXContentType"));
+
+            LOGGER.info("Message ID: {}, Type: {}, MIME Type: {}, Size: {} bytes", 
+                attributes.getMessageId(), attributes.getMessageType(), 
+                outputMediaType.toRfcString(), payloadBytes.length);
+            
+            // Parse payload based on content type
+            Object outputPayload = parsePayload(payloadBytes, outputMediaType);
+            
+            return Result.<Object, MessageAttributes>builder()
+                    .output(outputPayload)
+                    .attributes(attributes)
+                    .mediaType(outputMediaType)
+                    .build();
 
         } catch (JMSException e) {
             return handleJmsExceptionForConsume(e, connection);
         } catch (Exception e) {
             LOGGER.error("Unexpected error", e);
-            return buildErrorResponse("ERROR", "Unexpected error: " + e.getMessage());
+            return buildErrorResult("ERROR", "Unexpected error: " + e.getMessage());
         } finally {
             closeResources(consumer, session, connection);
         }
@@ -221,7 +260,7 @@ public class SapAmqpConnectorOperations {
         }
     }
 
-    private void addCustomHeaders(TextMessage msg, List<MessageHeader> headers) throws JMSException {
+    private void addCustomHeaders(Message msg, List<MessageHeader> headers) throws JMSException {
         if (headers == null || headers.isEmpty()) return;
         
         int headerCount = 0;
@@ -250,36 +289,223 @@ public class SapAmqpConnectorOperations {
         }
     }
 
-    private String extractPayload(Message message) throws Exception {
-        if (message instanceof TextMessage) {
-            return ((TextMessage) message).getText();
-        } else if (message instanceof BytesMessage) {
+    private byte[] extractPayloadAsBytes(Message message) throws Exception {
+        if (message instanceof BytesMessage) {
             BytesMessage bytesMessage = (BytesMessage) message;
-            byte[] bytes = new byte[(int) bytesMessage.getBodyLength()];
+            long bodyLength = bytesMessage.getBodyLength();
+            if (bodyLength > Integer.MAX_VALUE) {
+                throw new RuntimeException("Message too large: " + bodyLength + " bytes");
+            }
+            byte[] bytes = new byte[(int) bodyLength];
             bytesMessage.readBytes(bytes);
-            return new String(bytes, StandardCharsets.UTF_8);
+            LOGGER.debug("Extracted {} bytes from BytesMessage", bytes.length);
+            return bytes;
+        } else if (message instanceof TextMessage) {
+            String text = ((TextMessage) message).getText();
+            byte[] bytes = text != null ? text.getBytes(StandardCharsets.UTF_8) : new byte[0];
+            LOGGER.info("Extracted {} bytes from TextMessage", bytes.length); //changed to info
+            return bytes;
         } else if (message instanceof ObjectMessage) {
             Object obj = ((ObjectMessage) message).getObject();
-            return obj != null ? obj.toString() : "";
+            String text = obj != null ? obj.toString() : "";
+            byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
+            LOGGER.debug("Extracted {} bytes from ObjectMessage", bytes.length);
+            return bytes;
         } else {
-            return message.toString();
+            String text = message.toString();
+            byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
+            LOGGER.debug("Extracted {} bytes from generic Message", bytes.length);
+            return bytes;
         }
     }
 
-    private Map<String, Object> extractAttributes(Message message) throws Exception {
-        Map<String, Object> attributes = new HashMap<>();
+    private org.mule.runtime.api.metadata.MediaType extractMediaType(Message message) {
+        try {
+            // Check for AMQP 1.0 content-type property (standard for SAP Event Mesh and all AMQP clients)
+            // When consumed, Qpid JMS maps AMQP content-type to JMSXContentType
+            String contentType = message.getStringProperty("JMSXContentType");
+            if (contentType != null && !contentType.trim().isEmpty()) {
+                LOGGER.debug("Found AMQP content-type property: {}", contentType);
+                try {
+                    return org.mule.runtime.api.metadata.MediaType.parse(contentType);
+                } catch (Exception e) {
+                    LOGGER.debug("Content-type is not a valid MIME type: {}", contentType);
+                }
+            }
+            
+            // Fallback: Try to detect from JMSType (AMQP subject field)
+            String jmsType = message.getJMSType();
+            if (jmsType != null && !jmsType.trim().isEmpty()) {
+                LOGGER.debug("Attempting to parse JMSType as MIME type: {}", jmsType);
+                try {
+                    return org.mule.runtime.api.metadata.MediaType.parse(jmsType);
+                } catch (Exception e) {
+                    LOGGER.debug("JMSType is not a valid MIME type: {}", jmsType);
+                }
+            }
+            
+            // Default to ANY
+            LOGGER.debug("No MIME type found in any property, defaulting to ANY");
+            return org.mule.runtime.api.metadata.MediaType.ANY;
+            
+        } catch (Exception e) {
+            LOGGER.warn("Error extracting MIME type: {}", e.getMessage());
+            return org.mule.runtime.api.metadata.MediaType.ANY;
+        }
+    }
+
+    private Object parsePayload(byte[] payloadBytes, org.mule.runtime.api.metadata.MediaType mediaType) {
+        try {
+            String mimeType = mediaType.toRfcString().toLowerCase();
+            LOGGER.debug("Parsing payload with MIME type: {}", mimeType);
+            
+            // Handle JSON content types
+            if (mimeType.contains("application/json") || mimeType.contains("+json")) {
+                String jsonString = new String(payloadBytes, StandardCharsets.UTF_8);
+                LOGGER.debug("Parsing JSON payload (size: {} bytes)", payloadBytes.length);
+                
+                try {
+                    // Parse to Map/List structure for Mule to work with
+                    Object parsed = objectMapper.readValue(jsonString, Object.class);
+                    LOGGER.info("Successfully parsed JSON payload");
+                    return parsed;
+                } catch (Exception e) {
+                    LOGGER.warn("Failed to parse as JSON, returning as String: {}", e.getMessage());
+                    return jsonString;
+                }
+            }
+            
+            // Handle XML content types
+            if (mimeType.contains("application/xml") || 
+                mimeType.contains("text/xml") || 
+                mimeType.contains("+xml")) {
+                String xmlContent = new String(payloadBytes, StandardCharsets.UTF_8);
+                LOGGER.debug("Returning XML payload as String (size: {} bytes)", payloadBytes.length);
+                return xmlContent;
+            }
+            
+            // Handle CSV content types
+            if (mimeType.contains("text/csv") || 
+                mimeType.contains("application/csv")) {
+                String csvContent = new String(payloadBytes, StandardCharsets.UTF_8);
+                LOGGER.debug("Returning CSV payload as String (size: {} bytes)", payloadBytes.length);
+                return csvContent;
+            }
+            
+            // Handle plain text content types
+            if (mimeType.contains("text/plain")) {
+                String textContent = new String(payloadBytes, StandardCharsets.UTF_8);
+                LOGGER.debug("Returning plain text payload as String (size: {} bytes)", payloadBytes.length);
+                return textContent;
+            }
+            
+            // Handle other text-based content types
+            if (mimeType.startsWith("text/")) {
+                String textContent = new String(payloadBytes, StandardCharsets.UTF_8);
+                LOGGER.debug("Returning text/* payload as String (size: {} bytes)", payloadBytes.length);
+                return textContent;
+            }
+            
+            // Handle HTML content types
+            if (mimeType.contains("text/html") || 
+                mimeType.contains("application/xhtml")) {
+                String htmlContent = new String(payloadBytes, StandardCharsets.UTF_8);
+                LOGGER.debug("Returning HTML payload as String (size: {} bytes)", payloadBytes.length);
+                return htmlContent;
+            }
+            
+            // Handle YAML content types
+            if (mimeType.contains("application/yaml") || 
+                mimeType.contains("application/x-yaml") ||
+                mimeType.contains("text/yaml")) {
+                String yamlContent = new String(payloadBytes, StandardCharsets.UTF_8);
+                LOGGER.debug("Returning YAML payload as String (size: {} bytes)", payloadBytes.length);
+                return yamlContent;
+            }
+            
+            // For binary or unknown types, return as InputStream
+            LOGGER.debug("Returning payload as InputStream for binary/unknown content-type: {} (size: {} bytes)", 
+                mimeType, payloadBytes.length);
+            return new java.io.ByteArrayInputStream(payloadBytes);
+            
+        } catch (Exception e) {
+            LOGGER.warn("Failed to parse payload ({}), returning as InputStream: {}", 
+                mediaType.toRfcString(), e.getMessage());
+            return new java.io.ByteArrayInputStream(payloadBytes);
+        }
+    }
+
+    private MessageAttributes extractMessageAttributes(Message message) throws Exception {
+        MessageAttributes attributes = new MessageAttributes();
 
         // Standard JMS headers
-        attributes.put("messageId", message.getJMSMessageID());
-        attributes.put("timestamp", message.getJMSTimestamp());
-        attributes.put("correlationId", message.getJMSCorrelationID());
-        attributes.put("replyTo", message.getJMSReplyTo() != null ? message.getJMSReplyTo().toString() : null);
-        attributes.put("destination", message.getJMSDestination() != null ? message.getJMSDestination().toString() : null);
-        attributes.put("deliveryMode", message.getJMSDeliveryMode());
-        attributes.put("redelivered", message.getJMSRedelivered());
-        attributes.put("type", message.getJMSType());
-        attributes.put("expiration", message.getJMSExpiration());
-        attributes.put("priority", message.getJMSPriority());
+        attributes.setMessageId(message.getJMSMessageID());
+        attributes.setTimestamp(message.getJMSTimestamp());
+        attributes.setCorrelationId(message.getJMSCorrelationID());
+        attributes.setReplyTo(message.getJMSReplyTo() != null ? message.getJMSReplyTo().toString() : null);
+        attributes.setDestination(message.getJMSDestination() != null ? message.getJMSDestination().toString() : null);
+        attributes.setDeliveryMode(message.getJMSDeliveryMode());
+        attributes.setRedelivered(message.getJMSRedelivered());
+        attributes.setType(message.getJMSType());
+        attributes.setExpiration(message.getJMSExpiration());
+        attributes.setPriority(message.getJMSPriority());
+        
+        // Extract Content-Type from AMQP message
+        // Priority order: JMSXContentType (AMQP 1.0 standard) > custom SAP properties > fallback attempts
+        String contentType = message.getStringProperty("JMS_AMQP_ContentType");
+//        
+//        try {
+//            // Primary: Standard AMQP content-type (mapped to JMSXContentType by Qpid JMS)
+//            contentType = message.getStringProperty("JMSXContentType");
+//            if (contentType != null && !contentType.trim().isEmpty()) {
+//                LOGGER.debug("Content-Type extracted from JMSXContentType: {}", contentType);
+//            }
+//        } catch (Exception e) {
+//            LOGGER.debug("Could not extract JMSXContentType: {}", e.getMessage());
+//        }
+//        
+//        // Fallback: Try SAP-specific property names
+//        if (contentType == null || contentType.trim().isEmpty()) {
+//            try {
+//                contentType = message.getStringProperty("JMS_AMQP_ContentType");
+//                if (contentType != null && !contentType.trim().isEmpty()) {
+//                    LOGGER.debug("Content-Type extracted from JMS_SAP_ContentType: {}", contentType);
+//                }
+//            } catch (Exception e) {
+//                LOGGER.debug("Could not extract JMS_SAP_ContentType: {}", e.getMessage());
+//            }
+//        }
+//        
+//        // Additional fallback attempts
+//        if (contentType == null || contentType.trim().isEmpty()) {
+//            try {
+//                contentType = message.getStringProperty("contentType");
+//                if (contentType != null && !contentType.trim().isEmpty()) {
+//                    LOGGER.debug("Content-Type extracted from contentType: {}", contentType);
+//                }
+//            } catch (Exception e) {
+//                LOGGER.debug("Could not extract contentType: {}", e.getMessage());
+//            }
+//        }
+//        
+//        if (contentType == null || contentType.trim().isEmpty()) {
+//            try {
+//                contentType = message.getStringProperty("content_type");
+//                if (contentType != null && !contentType.trim().isEmpty()) {
+//                    LOGGER.debug("Content-Type extracted from content_type: {}", contentType);
+//                }
+//            } catch (Exception e) {
+//                LOGGER.debug("Could not extract content_type: {}", e.getMessage());
+//            }
+//        }
+        
+        // Set the content type in attributes (even if null)
+        attributes.setContentType(contentType);
+        if (contentType != null) {
+            LOGGER.info("Content-Type set in attributes: {}", contentType);
+        } else {
+            LOGGER.debug("No Content-Type found in message properties");
+        }
         
         // Determine message type
         String messageType = "Unknown";
@@ -290,43 +516,65 @@ public class SapAmqpConnectorOperations {
         } else if (message instanceof ObjectMessage) {
             messageType = "ObjectMessage";
         }
-        attributes.put("messageType", messageType);
+        attributes.setMessageType(messageType);
+        
+        // Extract MIME type and store in attributes for reference
+        try {
+            String mimeType = message.getStringProperty("JMSXContentType");
+            if (mimeType != null) {
+                attributes.setMimeType(mimeType);
+            }
+        } catch (Exception e) {
+            LOGGER.debug("Could not extract MIME type property: {}", e.getMessage());
+        }
 
         // Custom properties
+        Map<String, Object> customProperties = new HashMap<>();
         java.util.Enumeration<?> propertyNames = message.getPropertyNames();
         while (propertyNames.hasMoreElements()) {
             String propertyName = (String) propertyNames.nextElement();
+            
+            // Skip internal properties
+            if (JMS_AMQP_CONTENT_TYPE.equals(propertyName) ||
+                "JMSXContentType".equals(propertyName)) {
+                continue;
+            }
+            
             Object propertyValue = message.getObjectProperty(propertyName);
-            attributes.put("property_" + propertyName, propertyValue);
+            customProperties.put(propertyName, propertyValue);
         }
+        attributes.setCustomProperties(customProperties);
 
         return attributes;
     }
 
-    private String convertPayloadToString(Object payload) throws Exception {
+    private byte[] convertPayloadToBytes(Object payload) throws Exception {
         if (payload == null) {
-            return "";
+            return new byte[0];
         }
         
         if (payload instanceof String) {
-            return (String) payload;
+            // String content - preserve as-is without any transformation
+            return ((String) payload).getBytes(StandardCharsets.UTF_8);
         }
         
         if (payload instanceof byte[]) {
-            return new String((byte[]) payload, StandardCharsets.UTF_8);
+            return (byte[]) payload;
         }
         
         if (payload instanceof InputStream) {
             try (InputStream is = (InputStream) payload) {
-                return new String(readAllBytes(is), StandardCharsets.UTF_8);
+                return readAllBytes(is);
             }
         }
         
+        // For other objects, try to serialize to JSON
         try {
-            return objectMapper.writeValueAsString(payload);
+            String jsonString = objectMapper.writeValueAsString(payload);
+            return jsonString.getBytes(StandardCharsets.UTF_8);
         } catch (Exception e) {
             LOGGER.warn("Failed to serialize payload to JSON, using toString(): {}", e.getMessage());
-            return payload.toString();
+            return payload.toString().getBytes(StandardCharsets.UTF_8);
         }
     }
     
@@ -341,41 +589,51 @@ public class SapAmqpConnectorOperations {
         return buffer.toByteArray();
     }
 
-    private String buildSuccessResponse(String payload, Map<String, Object> attributes) throws Exception {
-        Map<String, Object> result = new HashMap<>();
-        result.put("status", "SUCCESS");
-        result.put("payload", payload);
-        result.put("messageId", attributes.get("messageId"));
-        result.put("timestamp", attributes.get("timestamp"));
-        result.put("correlationId", attributes.get("correlationId"));
-        result.put("messageType", attributes.get("messageType"));
-        result.put("redelivered", attributes.get("redelivered"));
-        result.put("priority", attributes.get("priority"));
-        result.put("allAttributes", attributes);
-        
-        return objectMapper.writeValueAsString(result);
-    }
-
-    private String buildNoMessageResponse(long timeout) {
+    private Result<Object, MessageAttributes> buildNoMessageResult(long timeout) {
         try {
-            Map<String, Object> result = new HashMap<>();
-            result.put("status", "NO_MESSAGE");
-            result.put("message", "No message available in queue within timeout period");
-            result.put("timeout", timeout);
-            return objectMapper.writeValueAsString(result);
+            MessageAttributes attributes = new MessageAttributes();
+            attributes.setStatus("NO_MESSAGE");
+            attributes.setStatusMessage("No message available in queue within timeout period");
+            attributes.setTimeout(timeout);
+            
+            InputStream emptyStream = new java.io.ByteArrayInputStream(new byte[0]);
+            
+            return Result.<Object, MessageAttributes>builder()
+                    .output(emptyStream)
+                    .attributes(attributes)
+                    .mediaType(org.mule.runtime.api.metadata.MediaType.ANY)
+                    .build();
         } catch (Exception e) {
-            return "{\"status\":\"NO_MESSAGE\",\"timeout\":" + timeout + "}";
+            LOGGER.error("Error building no message result", e);
+            return buildErrorResult("ERROR", "Error building response: " + e.getMessage());
         }
     }
 
-    private String buildErrorResponse(String status, String errorMessage) {
+    private Result<Object, MessageAttributes> buildErrorResult(String status, String errorMessage) {
         try {
-            Map<String, Object> error = new HashMap<>();
-            error.put("status", status);
-            error.put("error", errorMessage);
-            return objectMapper.writeValueAsString(error);
+            MessageAttributes attributes = new MessageAttributes();
+            attributes.setStatus(status);
+            attributes.setErrorMessage(errorMessage);
+            
+            InputStream emptyStream = new java.io.ByteArrayInputStream(new byte[0]);
+            
+            return Result.<Object, MessageAttributes>builder()
+                    .output(emptyStream)
+                    .attributes(attributes)
+                    .mediaType(org.mule.runtime.api.metadata.MediaType.ANY)
+                    .build();
         } catch (Exception e) {
-            return "{\"status\":\"ERROR\",\"error\":\"" + errorMessage.replace("\"", "\\\"") + "\"}";
+            LOGGER.error("Error building error result", e);
+            // Fallback - return minimal result
+            MessageAttributes fallbackAttrs = new MessageAttributes();
+            fallbackAttrs.setStatus("ERROR");
+            fallbackAttrs.setErrorMessage("Critical error: " + e.getMessage());
+            InputStream emptyStream = new java.io.ByteArrayInputStream(new byte[0]);
+            return Result.<Object, MessageAttributes>builder()
+                    .output(emptyStream)
+                    .attributes(fallbackAttrs)
+                    .mediaType(org.mule.runtime.api.metadata.MediaType.ANY)
+                    .build();
         }
     }
 
@@ -394,17 +652,17 @@ public class SapAmqpConnectorOperations {
         }
     }
 
-    private String handleJmsExceptionForConsume(JMSException e, SapAmqpConnectorConnection connection) {
+    private Result<Object, MessageAttributes> handleJmsExceptionForConsume(JMSException e, SapAmqpConnectorConnection connection) {
         String errorMessage = (e.getMessage() != null) ? e.getMessage().toLowerCase() : "";
         LOGGER.error("JMS Error: {}", e.getMessage());
         
         if (isAuthenticationError(errorMessage)) {
             LOGGER.warn("Authentication failed - invalidating token");
             connection.clearToken();
-            return buildErrorResponse("AUTHENTICATION_ERROR", "Authentication failed: " + e.getMessage());
+            return buildErrorResult("AUTHENTICATION_ERROR", "Authentication failed: " + e.getMessage());
         } else {
             LOGGER.error("JMSException occurred", e);
-            return buildErrorResponse("JMS_ERROR", "Error during JMS operation: " + e.getMessage());
+            return buildErrorResult("JMS_ERROR", "Error during JMS operation: " + e.getMessage());
         }
     }
 
