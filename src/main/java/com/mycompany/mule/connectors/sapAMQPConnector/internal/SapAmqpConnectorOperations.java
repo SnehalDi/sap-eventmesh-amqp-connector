@@ -315,8 +315,8 @@ public class SapAmqpConnectorOperations {
             BytesMessage bytesMessage = (BytesMessage) message;
             long bodyLength = bytesMessage.getBodyLength();
             
-            LOGGER.info("=== BytesMessage Detected ===");
-            LOGGER.info("Body length: {} bytes", bodyLength);
+            LOGGER.debug("=== BytesMessage Detected ===");
+            LOGGER.debug("Body length: {} bytes", bodyLength);
             
             if (bodyLength > Integer.MAX_VALUE) {
                 throw new RuntimeException("Message too large: " + bodyLength + " bytes");
@@ -330,14 +330,14 @@ public class SapAmqpConnectorOperations {
             byte[] bytes = new byte[(int) bodyLength];
             int bytesRead = bytesMessage.readBytes(bytes);
             
-            LOGGER.info("Extracted {} bytes from BytesMessage", bytesRead);
+            LOGGER.debug("Extracted {} bytes from BytesMessage", bytesRead);
             return bytes;
             
         } else if (message instanceof TextMessage) {
             TextMessage textMessage = (TextMessage) message;
             String text = textMessage.getText();
             
-            LOGGER.info("=== TextMessage Detected ===");
+            LOGGER.debug("=== TextMessage Detected ===");
             
             if (text == null) {
                 LOGGER.warn("TextMessage has null content");
@@ -346,12 +346,12 @@ public class SapAmqpConnectorOperations {
             
             // Log preview of text content
             String preview = text.length() > 100 ? text.substring(0, 100) + "..." : text;
-            LOGGER.info("Text content preview: {}", preview);
-            LOGGER.info("Text content length: {} characters", text.length());
+            LOGGER.debug("Text content preview: {}", preview);
+            LOGGER.debug("Text content length: {} characters", text.length());
             
             // Convert text to bytes using UTF-8
             byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
-            LOGGER.info("Extracted {} bytes from TextMessage", bytes.length);
+            LOGGER.debug("Extracted {} bytes from TextMessage", bytes.length);
             
             return bytes;
             
@@ -359,7 +359,7 @@ public class SapAmqpConnectorOperations {
             ObjectMessage objMessage = (ObjectMessage) message;
             Object obj = objMessage.getObject();
             
-            LOGGER.info("ObjectMessage detected");
+            LOGGER.debug("ObjectMessage detected");
             
             if (obj == null) {
                 LOGGER.warn("ObjectMessage has null content");
@@ -369,17 +369,17 @@ public class SapAmqpConnectorOperations {
             // Handle different object types
             if (obj instanceof byte[]) {
                 byte[] bytes = (byte[]) obj;
-                LOGGER.info("ObjectMessage contains byte array of {} bytes", bytes.length);
+                LOGGER.debug("ObjectMessage contains byte array of {} bytes", bytes.length);
                 return bytes;
             } else if (obj instanceof String) {
                 String text = (String) obj;
                 byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
-                LOGGER.info("ObjectMessage contains String of {} characters ({} bytes)", 
+                LOGGER.debug("ObjectMessage contains String of {} characters ({} bytes)", 
                     text.length(), bytes.length);
                 return bytes;
             } else {
                 // Serialize to JSON
-                LOGGER.info("ObjectMessage contains {} object, serializing to JSON", 
+                LOGGER.debug("ObjectMessage contains {} object, serializing to JSON", 
                     obj.getClass().getSimpleName());
                 String json = objectMapper.writeValueAsString(obj);
                 return json.getBytes(StandardCharsets.UTF_8);
@@ -388,7 +388,7 @@ public class SapAmqpConnectorOperations {
         } else if (message instanceof MapMessage) {
             MapMessage mapMessage = (MapMessage) message;
             
-            LOGGER.info("MapMessage detected, converting to JSON");
+            LOGGER.debug("MapMessage detected, converting to JSON");
             
             // Convert MapMessage to JSON
             Map<String, Object> map = new HashMap<>();
@@ -401,7 +401,7 @@ public class SapAmqpConnectorOperations {
             
             String json = objectMapper.writeValueAsString(map);
             byte[] bytes = json.getBytes(StandardCharsets.UTF_8);
-            LOGGER.info("Extracted {} bytes from MapMessage (converted to JSON)", bytes.length);
+            LOGGER.debug("Extracted {} bytes from MapMessage (converted to JSON)", bytes.length);
             
             return bytes;
             
@@ -425,12 +425,12 @@ public class SapAmqpConnectorOperations {
             JmsMessage jmsMessage = (JmsMessage) message;
             AmqpJmsMessageFacade facade = (AmqpJmsMessageFacade) jmsMessage.getFacade();
             
-            LOGGER.info("==========================================");
-            LOGGER.info("AMQP MESSAGE PROPERTIES");
-            LOGGER.info("==========================================");
+            LOGGER.debug("==========================================");
+            LOGGER.debug("AMQP MESSAGE PROPERTIES");
+            LOGGER.debug("==========================================");
             
             // Log AMQP standard properties
-            LOGGER.info("--- AMQP Standard Properties ---");
+            LOGGER.debug("--- AMQP Standard Properties ---");
             logProperty("Content-Type", facade.getContentType());
             logProperty("Message-ID", facade.getMessageId());
             logProperty("Correlation-ID", facade.getCorrelationId());
@@ -440,22 +440,22 @@ public class SapAmqpConnectorOperations {
             logProperty("Reply-To-Group-ID", facade.getReplyToGroupId());
             
             // Log all application properties
-            LOGGER.info("--- Application Properties ---");
+            LOGGER.debug("--- Application Properties ---");
             Set<String> propertyNames = new HashSet<>();
             facade.getApplicationPropertyNames(propertyNames);
             
             if (propertyNames.isEmpty()) {
-                LOGGER.info("No application properties found");
+                LOGGER.debug("No application properties found");
             } else {
-                LOGGER.info("Found {} application properties:", propertyNames.size());
+                LOGGER.debug("Found {} application properties:", propertyNames.size());
                 for (String name : propertyNames) {
                     Object value = facade.getApplicationProperty(name);
                     String valueType = value != null ? value.getClass().getSimpleName() : "null";
-                    LOGGER.info("  {} = {} ({})", name, value, valueType);
+                    LOGGER.debug("  {} = {} ({})", name, value, valueType);
                 }
             }
             
-            LOGGER.info("==========================================");
+            LOGGER.debug("==========================================");
             
         } catch (ClassCastException e) {
             LOGGER.warn("Message facade is not AmqpJmsMessageFacade: {}", e.getMessage());
@@ -469,7 +469,7 @@ public class SapAmqpConnectorOperations {
      */
     private void logProperty(String name, Object value) {
         if (value != null) {
-            LOGGER.info("{}: {}", name, value);
+            LOGGER.debug("{}: {}", name, value);
         } else {
             LOGGER.debug("{}: <not set>", name);
         }
@@ -630,7 +630,7 @@ public class SapAmqpConnectorOperations {
             }
             
             attributes.setCustomProperties(customProperties);
-            LOGGER.info("Extracted {} total custom properties", customProperties.size());
+            LOGGER.debug("Extracted {} total custom properties", customProperties.size());
             
         } catch (ClassCastException e) {
             LOGGER.warn("Message facade is not AmqpJmsMessageFacade, falling back to standard JMS properties: {}", e.getMessage());
