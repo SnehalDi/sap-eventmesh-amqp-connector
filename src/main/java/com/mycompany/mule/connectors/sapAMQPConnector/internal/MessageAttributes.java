@@ -1,43 +1,40 @@
 package com.mycompany.mule.connectors.sapAMQPConnector.internal;
 
 import java.util.Map;
-import java.util.HashMap;
 
-/**
- * Immutable attributes class for SAP Event Mesh messages.
- * Contains metadata about consumed messages.
- */
 public class MessageAttributes {
     
-    // Standard JMS attributes
+    // Standard JMS headers
     private String messageId;
-    private Long timestamp;
+    private long timestamp;
     private String correlationId;
     private String replyTo;
     private String destination;
-    private Integer deliveryMode;
-    private Boolean redelivered;
+    private int deliveryMode;
+    private boolean redelivered;
     private String type;
-    private Long expiration;
-    private Integer priority;
+    private long expiration;
+    private int priority;
+    
+    // AMQP Standard Properties
+    private String contentType;
+    private String userId;
+    private String groupId;
+    private long groupSequence;
+    private String replyToGroupId;
+    
+    // Additional metadata
     private String messageType;
     private String mimeType;
-    private String contentType;
-    
-    // Status attributes (for error/no message cases)
     private String status;
     private String statusMessage;
     private String errorMessage;
     private Long timeout;
     
-    // Custom properties
+    // Custom properties (includes AMQP Application Properties)
     private Map<String, Object> customProperties;
     
-    public MessageAttributes() {
-        this.customProperties = new HashMap<>();
-    }
-    
-    // Getters and Setters for Standard JMS attributes
+    // Getters and Setters
     
     public String getMessageId() {
         return messageId;
@@ -47,11 +44,11 @@ public class MessageAttributes {
         this.messageId = messageId;
     }
     
-    public Long getTimestamp() {
+    public long getTimestamp() {
         return timestamp;
     }
     
-    public void setTimestamp(Long timestamp) {
+    public void setTimestamp(long timestamp) {
         this.timestamp = timestamp;
     }
     
@@ -79,19 +76,19 @@ public class MessageAttributes {
         this.destination = destination;
     }
     
-    public Integer getDeliveryMode() {
+    public int getDeliveryMode() {
         return deliveryMode;
     }
     
-    public void setDeliveryMode(Integer deliveryMode) {
+    public void setDeliveryMode(int deliveryMode) {
         this.deliveryMode = deliveryMode;
     }
     
-    public Boolean getRedelivered() {
+    public boolean isRedelivered() {
         return redelivered;
     }
     
-    public void setRedelivered(Boolean redelivered) {
+    public void setRedelivered(boolean redelivered) {
         this.redelivered = redelivered;
     }
     
@@ -103,21 +100,65 @@ public class MessageAttributes {
         this.type = type;
     }
     
-    public Long getExpiration() {
+    public long getExpiration() {
         return expiration;
     }
     
-    public void setExpiration(Long expiration) {
+    public void setExpiration(long expiration) {
         this.expiration = expiration;
     }
     
-    public Integer getPriority() {
+    public int getPriority() {
         return priority;
     }
     
-    public void setPriority(Integer priority) {
+    public void setPriority(int priority) {
         this.priority = priority;
     }
+    
+    // AMQP Standard Properties
+    
+    public String getContentType() {
+        return contentType;
+    }
+    
+    public void setContentType(String contentType) {
+        this.contentType = contentType;
+    }
+    
+    public String getUserId() {
+        return userId;
+    }
+    
+    public void setUserId(String userId) {
+        this.userId = userId;
+    }
+    
+    public String getGroupId() {
+        return groupId;
+    }
+    
+    public void setGroupId(String groupId) {
+        this.groupId = groupId;
+    }
+    
+    public long getGroupSequence() {
+        return groupSequence;
+    }
+    
+    public void setGroupSequence(long groupSequence) {
+        this.groupSequence = groupSequence;
+    }
+    
+    public String getReplyToGroupId() {
+        return replyToGroupId;
+    }
+    
+    public void setReplyToGroupId(String replyToGroupId) {
+        this.replyToGroupId = replyToGroupId;
+    }
+    
+    // Additional metadata
     
     public String getMessageType() {
         return messageType;
@@ -134,8 +175,6 @@ public class MessageAttributes {
     public void setMimeType(String mimeType) {
         this.mimeType = mimeType;
     }
-    
-    // Getters and Setters for Status attributes
     
     public String getStatus() {
         return status;
@@ -157,10 +196,6 @@ public class MessageAttributes {
         return errorMessage;
     }
     
-    public void setContentType(String contentType) {
-        this.contentType = contentType;
-    }
-    
     public void setErrorMessage(String errorMessage) {
         this.errorMessage = errorMessage;
     }
@@ -173,13 +208,13 @@ public class MessageAttributes {
         this.timeout = timeout;
     }
     
-    // Getters and Setters for Custom properties
+    // Custom Properties (includes AMQP Application Properties)
     
     public Map<String, Object> getCustomProperties() {
         return customProperties;
     }
     
     public void setCustomProperties(Map<String, Object> customProperties) {
-        this.customProperties = customProperties != null ? customProperties : new HashMap<>();
+        this.customProperties = customProperties;
     }
 }

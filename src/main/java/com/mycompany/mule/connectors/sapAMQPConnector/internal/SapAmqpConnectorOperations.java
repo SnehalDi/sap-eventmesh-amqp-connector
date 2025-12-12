@@ -1,3 +1,4 @@
+
 package com.mycompany.mule.connectors.sapAMQPConnector.internal;
 
 import static org.mule.runtime.extension.api.annotation.param.MediaType.ANY;
@@ -18,7 +19,6 @@ import org.mule.runtime.extension.api.annotation.metadata.OutputResolver;
 import jakarta.jms.*;
 import org.apache.qpid.jms.message.JmsMessage; 
 import org.apache.qpid.jms.provider.amqp.message.AmqpJmsMessageFacade;
-//remove later
 import org.apache.qpid.jms.JmsConnectionFactory;
 import org.mule.runtime.api.connection.ConnectionException;
 
@@ -164,18 +164,27 @@ public class SapAmqpConnectorOperations {
             byte[] payloadBytes = extractPayloadAsBytes(message);
             MessageAttributes attributes = extractMessageAttributes(message);
             
-            // Extract and parse MIME type from JMS properties
-            org.mule.runtime.api.metadata.MediaType outputMediaType = extractMediaType(message);
+            // Get content-type from attributes (extracted from AMQP properties)
+            String contentType = attributes.getContentType();
+            org.mule.runtime.api.metadata.MediaType outputMediaType;
             
-            LOGGER.info("custom contentType: {}", message.getStringProperty("contentType"));
-            LOGGER.info("contentType: {}", message.getStringProperty("JMS_AMQP_ContentType"));
-;           LOGGER.info("JMSX contentType: {}", message.getStringProperty("JMSXContentType"));
-
-            LOGGER.info("Message ID: {}, Type: {}, MIME Type: {}, Size: {} bytes", 
-                attributes.getMessageId(), attributes.getMessageType(), 
-                outputMediaType.toRfcString(), payloadBytes.length);
+            if (contentType != null && !contentType.trim().isEmpty()) {
+                try {
+                    outputMediaType = org.mule.runtime.api.metadata.MediaType.parse(contentType);
+                    LOGGER.info("Using AMQP content-type: {}", contentType);
+                } catch (Exception e) {
+                    LOGGER.warn("Invalid content-type '{}', defaulting to ANY: {}", contentType, e.getMessage());
+                    outputMediaType = org.mule.runtime.api.metadata.MediaType.ANY;
+                }
+            } else {
+                LOGGER.info("No content-type found, defaulting to ANY");
+                outputMediaType = org.mule.runtime.api.metadata.MediaType.ANY;
+            }
             
-            // Parse payload based on content type
+            LOGGER.info("Message ID: {}, Content-Type: {}, Size: {} bytes", 
+                attributes.getMessageId(), contentType, payloadBytes.length);
+            
+            // Parse payload based on content type from AMQP properties
             Object outputPayload = parsePayload(payloadBytes, outputMediaType);
             
             return Result.<Object, MessageAttributes>builder()
@@ -298,8 +307,8 @@ public class SapAmqpConnectorOperations {
     private byte[] extractPayloadAsBytes(Message message) throws Exception {
         LOGGER.debug("Message type: {}", message.getClass().getName());
         
-        // Extract and log AMQP properties using helper method
-        extractAndLogAmqpProperties(message);
+        // Log AMQP properties
+        logAmqpProperties(message);
         
         // Extract payload based on JMS message type
         if (message instanceof BytesMessage) {
@@ -409,45 +418,26 @@ public class SapAmqpConnectorOperations {
     }
 
     /**
-     * Extracts and logs all AMQP properties from the message facade.
-     * This method works for all JmsMessage types (TextMessage, BytesMessage, ObjectMessage, etc.)
-     * as they all extend JmsMessage and have access to the AMQP facade.
-     * 
-     * @param message The JMS message to extract properties from
+     * Logs AMQP properties from the message facade for debugging purposes.
      */
-    private void extractAndLogAmqpProperties(Message message) {
-        
+    private void logAmqpProperties(Message message) {
         try {
             JmsMessage jmsMessage = (JmsMessage) message;
             AmqpJmsMessageFacade facade = (AmqpJmsMessageFacade) jmsMessage.getFacade();
             
             LOGGER.info("==========================================");
-            LOGGER.info("AMQP MESSAGE PROPERTIES (via Facade)");
+            LOGGER.info("AMQP MESSAGE PROPERTIES");
             LOGGER.info("==========================================");
             
             // Log AMQP standard properties
             LOGGER.info("--- AMQP Standard Properties ---");
             logProperty("Content-Type", facade.getContentType());
-//            logProperty("Content-Encoding", facade.getContentEncoding());
             logProperty("Message-ID", facade.getMessageId());
             logProperty("Correlation-ID", facade.getCorrelationId());
-           // logProperty("Subject", facade.getSubject());
             logProperty("User-ID", facade.getUserId());
             logProperty("Group-ID", facade.getGroupId());
             logProperty("Group-Sequence", facade.getGroupSequence());
             logProperty("Reply-To-Group-ID", facade.getReplyToGroupId());
-            
-           
-            
-//            try {
-//                long expiryTime = facade.getAbsoluteExpiryTime();
-//                if (expiryTime > 0) {
-//                    LOGGER.info("Absolute-Expiry-Time: {} ({})", expiryTime,
-//                        new java.util.Date(expiryTime));
-//                }
-//            } catch (Exception e) {
-//                LOGGER.debug("Expiry time not available");
-//            }
             
             // Log all application properties
             LOGGER.info("--- Application Properties ---");
@@ -485,135 +475,17 @@ public class SapAmqpConnectorOperations {
         }
     }
 
-    /**
-     * Extracts AMQP properties from the message facade and returns them as a Map.
-     * This is useful for storing in MessageAttributes or for programmatic access.
-     * 
-     * @param message The JMS message to extract properties from
-     * @return Map of AMQP properties, or empty map if not accessible
-     */
-//    private Map<String, Object> getAmqpPropertiesMap(Message message) {
-//        Map<String, Object> amqpProperties = new HashMap<>();
-//        
-//        
-//        try {
-//            JmsMessage jmsMessage = (JmsMessage) message;
-//            AmqpJmsMessageFacade facade = (AmqpJmsMessageFacade) jmsMessage.getFacade();
-//            
-//            // Standard AMQP properties
-//            if (facade.getContentType() != null) {
-//                amqpProperties.put("contentType", facade.getContentType());
-//            }
-////            if (facade.getContentEncoding() != null) {
-////                amqpProperties.put("contentEncoding", facade.getContentEncoding());
-////            }
-//            if (facade.getMessageId() != null) {
-//                amqpProperties.put("messageId", facade.getMessageId());
-//            }
-//            if (facade.getCorrelationId() != null) {
-//                amqpProperties.put("correlationId", facade.getCorrelationId());
-//            }
-////            if (facade.getSubject() != null) {
-////                amqpProperties.put("subject", facade.getSubject());
-////            }
-//            if (facade.getUserId() != null) {
-//                amqpProperties.put("userId", facade.getUserId());
-//            }
-//            if (facade.getGroupId() != null) {
-//                amqpProperties.put("groupId", facade.getGroupId());
-//            }
-//            amqpProperties.put("groupSequence", facade.getGroupSequence());
-//            if (facade.getReplyToGroupId() != null) {
-//                amqpProperties.put("replyToGroupId", facade.getReplyToGroupId());
-//            }
-//            
-//            // Timestamps
-////            long creationTime = facade.getCreationTime();
-////            if (creationTime > 0) {
-////                amqpProperties.put("creationTime", creationTime);
-////            }
-////            
-////            long expiryTime = facade.getAbsoluteExpiryTime();
-////            if (expiryTime > 0) {
-////                amqpProperties.put("absoluteExpiryTime", expiryTime);
-////            }
-//            
-//            // Application properties
-//            Set<String> propertyNames = new HashSet<>();
-//            facade.getApplicationPropertyNames(propertyNames);
-//            
-//            if (!propertyNames.isEmpty()) {
-//                Map<String, Object> appProps = new HashMap<>();
-//                for (String name : propertyNames) {
-//                    Object value = facade.getApplicationProperty(name);
-//                    appProps.put(name, value);
-//                }
-//                amqpProperties.put("applicationProperties", appProps);
-//            }
-//            
-//        } catch (Exception e) {
-//            LOGGER.debug("Could not extract AMQP properties: {}", e.getMessage());
-//        }
-//        
-//        return amqpProperties;
-//    }
-//    
-    
-    
-    private org.mule.runtime.api.metadata.MediaType extractMediaType(Message message) {
-        try {
-            // Check for AMQP 1.0 content-type property (standard for SAP Event Mesh and all AMQP clients)
-            // When consumed, Qpid JMS maps AMQP content-type to JMSXContentType
-            String contentType = message.getStringProperty("JMSXContentType");
-            if (contentType != null && !contentType.trim().isEmpty()) {
-                LOGGER.debug("Found AMQP content-type property: {}", contentType);
-                try {
-                    return org.mule.runtime.api.metadata.MediaType.parse(contentType);
-                } catch (Exception e) {
-                    LOGGER.debug("Content-type is not a valid MIME type: {}", contentType);
-                }
-            }
-            
-            // Fallback: Try to detect from JMSType (AMQP subject field)
-            String jmsType = message.getJMSType();
-            if (jmsType != null && !jmsType.trim().isEmpty()) {
-                LOGGER.debug("Attempting to parse JMSType as MIME type: {}", jmsType);
-                try {
-                    return org.mule.runtime.api.metadata.MediaType.parse(jmsType);
-                } catch (Exception e) {
-                    LOGGER.debug("JMSType is not a valid MIME type: {}", jmsType);
-                }
-            }
-            
-            // Default to ANY
-            LOGGER.debug("No MIME type found in any property, defaulting to ANY");
-            return org.mule.runtime.api.metadata.MediaType.ANY;
-            
-        } catch (Exception e) {
-            LOGGER.warn("Error extracting MIME type: {}", e.getMessage());
-            return org.mule.runtime.api.metadata.MediaType.ANY;
-        }
-    }
-
     private Object parsePayload(byte[] payloadBytes, org.mule.runtime.api.metadata.MediaType mediaType) {
         try {
             String mimeType = mediaType.toRfcString().toLowerCase();
             LOGGER.debug("Parsing payload with MIME type: {}", mimeType);
             
-            // Handle JSON content types
+            // Handle JSON content types - return as String for Mule compatibility
             if (mimeType.contains("application/json") || mimeType.contains("+json")) {
                 String jsonString = new String(payloadBytes, StandardCharsets.UTF_8);
-                LOGGER.debug("Parsing JSON payload (size: {} bytes)", payloadBytes.length);
-                
-                try {
-                    // Parse to Map/List structure for Mule to work with
-                    Object parsed = objectMapper.readValue(jsonString, Object.class);
-                    LOGGER.info("Successfully parsed JSON payload");
-                    return parsed;
-                } catch (Exception e) {
-                    LOGGER.warn("Failed to parse as JSON, returning as String: {}", e.getMessage());
-                    return jsonString;
-                }
+                LOGGER.debug("Returning JSON payload as String (size: {} bytes)", payloadBytes.length);
+                LOGGER.info("Successfully prepared JSON payload");
+                return jsonString;  // Return as String, not parsed object
             }
             
             // Handle XML content types
@@ -675,7 +547,7 @@ public class SapAmqpConnectorOperations {
             return new java.io.ByteArrayInputStream(payloadBytes);
         }
     }
-
+    
     private MessageAttributes extractMessageAttributes(Message message) throws Exception {
         MessageAttributes attributes = new MessageAttributes();
 
@@ -691,104 +563,117 @@ public class SapAmqpConnectorOperations {
         attributes.setExpiration(message.getJMSExpiration());
         attributes.setPriority(message.getJMSPriority());
         
-        // Extract Content-Type from AMQP message
-        // Priority order: JMSXContentType (AMQP 1.0 standard) > custom SAP properties > fallback attempts
-        String contentType = message.getStringProperty("JMS_AMQP_ContentType");
-//        
-//        try {
-//            // Primary: Standard AMQP content-type (mapped to JMSXContentType by Qpid JMS)
-//            contentType = message.getStringProperty("JMSXContentType");
-//            if (contentType != null && !contentType.trim().isEmpty()) {
-//                LOGGER.debug("Content-Type extracted from JMSXContentType: {}", contentType);
-//            }
-//        } catch (Exception e) {
-//            LOGGER.debug("Could not extract JMSXContentType: {}", e.getMessage());
-//        }
-//        
-//        // Fallback: Try SAP-specific property names
-//        if (contentType == null || contentType.trim().isEmpty()) {
-//            try {
-//                contentType = message.getStringProperty("JMS_AMQP_ContentType");
-//                if (contentType != null && !contentType.trim().isEmpty()) {
-//                    LOGGER.debug("Content-Type extracted from JMS_SAP_ContentType: {}", contentType);
-//                }
-//            } catch (Exception e) {
-//                LOGGER.debug("Could not extract JMS_SAP_ContentType: {}", e.getMessage());
-//            }
-//        }
-//        
-//        // Additional fallback attempts
-//        if (contentType == null || contentType.trim().isEmpty()) {
-//            try {
-//                contentType = message.getStringProperty("contentType");
-//                if (contentType != null && !contentType.trim().isEmpty()) {
-//                    LOGGER.debug("Content-Type extracted from contentType: {}", contentType);
-//                }
-//            } catch (Exception e) {
-//                LOGGER.debug("Could not extract contentType: {}", e.getMessage());
-//            }
-//        }
-//        
-//        if (contentType == null || contentType.trim().isEmpty()) {
-//            try {
-//                contentType = message.getStringProperty("content_type");
-//                if (contentType != null && !contentType.trim().isEmpty()) {
-//                    LOGGER.debug("Content-Type extracted from content_type: {}", contentType);
-//                }
-//            } catch (Exception e) {
-//                LOGGER.debug("Could not extract content_type: {}", e.getMessage());
-//            }
-//        }
-        
-        // Set the content type in attributes (even if null)
-        attributes.setContentType(contentType);
-        if (contentType != null) {
-            LOGGER.info("Content-Type set in attributes: {}", contentType);
-        } else {
-            LOGGER.debug("No Content-Type found in message properties");
-        }
-        
-        // Determine message type
-        String messageType = "Unknown";
-        if (message instanceof TextMessage) {
-            messageType = "TextMessage";
-        } else if (message instanceof BytesMessage) {
-            messageType = "BytesMessage";
-        } else if (message instanceof ObjectMessage) {
-            messageType = "ObjectMessage";
-        }
-        attributes.setMessageType(messageType);
-        
-        // Extract MIME type and store in attributes for reference
+        // Extract AMQP properties and add to attributes
         try {
-            String mimeType = message.getStringProperty("JMSXContentType");
-            if (mimeType != null) {
-                attributes.setMimeType(mimeType);
+            JmsMessage jmsMessage = (JmsMessage) message;
+            AmqpJmsMessageFacade facade = (AmqpJmsMessageFacade) jmsMessage.getFacade();
+            
+            LOGGER.debug("Extracting AMQP properties into MessageAttributes");
+            
+            // AMQP Standard Properties
+            if (facade.getContentType() != null) {
+                String contentTypeStr = facade.getContentType().toString();
+                attributes.setContentType(contentTypeStr);
+                LOGGER.debug("Set contentType: {}", contentTypeStr);
             }
+            
+            if (facade.getUserId() != null) {
+                String userIdStr = facade.getUserId().toString();
+                attributes.setUserId(userIdStr);
+                LOGGER.debug("Set userId: {}", userIdStr);
+            }
+            
+            if (facade.getGroupId() != null) {
+                attributes.setGroupId(facade.getGroupId());
+                LOGGER.debug("Set groupId: {}", facade.getGroupId());
+            }
+            
+            attributes.setGroupSequence(facade.getGroupSequence());
+            LOGGER.debug("Set groupSequence: {}", facade.getGroupSequence());
+            
+            if (facade.getReplyToGroupId() != null) {
+                attributes.setReplyToGroupId(facade.getReplyToGroupId());
+                LOGGER.debug("Set replyToGroupId: {}", facade.getReplyToGroupId());
+            }
+            
+            // Extract AMQP Application Properties into custom properties
+            Map<String, Object> customProperties = new HashMap<>();
+            Set<String> propertyNames = new HashSet<>();
+            facade.getApplicationPropertyNames(propertyNames);
+            
+            if (!propertyNames.isEmpty()) {
+                LOGGER.debug("Extracting {} AMQP application properties", propertyNames.size());
+                for (String name : propertyNames) {
+                    Object value = facade.getApplicationProperty(name);
+                    customProperties.put(name, value);
+                    LOGGER.debug("Added AMQP application property: {} = {}", name, value);
+                }
+            }
+            
+            // Also add standard JMS custom properties (non-internal)
+            java.util.Enumeration<?> jmsPropertyNames = message.getPropertyNames();
+            while (jmsPropertyNames.hasMoreElements()) {
+                String propertyName = (String) jmsPropertyNames.nextElement();
+                
+                // Skip internal properties that are already handled
+                if (JMS_AMQP_CONTENT_TYPE.equals(propertyName) ||
+                    "JMSXContentType".equals(propertyName)) {
+                    continue;
+                }
+                
+                // Only add if not already present from AMQP application properties
+                if (!customProperties.containsKey(propertyName)) {
+                    Object propertyValue = message.getObjectProperty(propertyName);
+                    customProperties.put(propertyName, propertyValue);
+                    LOGGER.debug("Added JMS property: {} = {}", propertyName, propertyValue);
+                }
+            }
+            
+            attributes.setCustomProperties(customProperties);
+            LOGGER.info("Extracted {} total custom properties", customProperties.size());
+            
+        } catch (ClassCastException e) {
+            LOGGER.warn("Message facade is not AmqpJmsMessageFacade, falling back to standard JMS properties: {}", e.getMessage());
+            
+            // Fallback: Extract standard JMS properties only
+            Map<String, Object> customProperties = new HashMap<>();
+            java.util.Enumeration<?> propertyNames = message.getPropertyNames();
+            while (propertyNames.hasMoreElements()) {
+                String propertyName = (String) propertyNames.nextElement();
+                
+                if (JMS_AMQP_CONTENT_TYPE.equals(propertyName) ||
+                    "JMSXContentType".equals(propertyName)) {
+                    continue;
+                }
+                
+                Object propertyValue = message.getObjectProperty(propertyName);
+                customProperties.put(propertyName, propertyValue);
+            }
+            attributes.setCustomProperties(customProperties);
+            
         } catch (Exception e) {
-            LOGGER.debug("Could not extract MIME type property: {}", e.getMessage());
-        }
-
-        // Custom properties - avoid
-        Map<String, Object> customProperties = new HashMap<>();
-        java.util.Enumeration<?> propertyNames = message.getPropertyNames();
-        while (propertyNames.hasMoreElements()) {
-            String propertyName = (String) propertyNames.nextElement();
+            LOGGER.error("Error extracting AMQP properties: {}", e.getMessage(), e);
             
-            // Skip internal properties
-            if (JMS_AMQP_CONTENT_TYPE.equals(propertyName) ||
-                "JMSXContentType".equals(propertyName)) {
-                continue;
+            // Fallback to standard JMS properties
+            Map<String, Object> customProperties = new HashMap<>();
+            java.util.Enumeration<?> propertyNames = message.getPropertyNames();
+            while (propertyNames.hasMoreElements()) {
+                String propertyName = (String) propertyNames.nextElement();
+                
+                if (JMS_AMQP_CONTENT_TYPE.equals(propertyName) ||
+                    "JMSXContentType".equals(propertyName)) {
+                    continue;
+                }
+                
+                Object propertyValue = message.getObjectProperty(propertyName);
+                customProperties.put(propertyName, propertyValue);
             }
-            
-            Object propertyValue = message.getObjectProperty(propertyName);
-            customProperties.put(propertyName, propertyValue);
+            attributes.setCustomProperties(customProperties);
         }
-        attributes.setCustomProperties(customProperties);
 
         return attributes;
     }
-
+    
     private byte[] convertPayloadToBytes(Object payload) throws Exception {
         if (payload == null) {
             return new byte[0];
