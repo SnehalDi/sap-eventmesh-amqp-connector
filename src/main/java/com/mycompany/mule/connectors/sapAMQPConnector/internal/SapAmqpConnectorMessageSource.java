@@ -58,8 +58,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  */
 enum AcknowledgmentMode {
     AUTO,
-    CLIENT,
-    DUPS_OK
+    CLIENT
 }
 
 /**
@@ -280,7 +279,7 @@ public class SapAmqpConnectorMessageSource extends Source<Object, MessageAttribu
                 
                 // Create session
                 session = jmsConn.createSession(
-                    sessionAckMode == Session.CLIENT_ACKNOWLEDGE,
+                    false,
                     sessionAckMode
                 );
                 LOGGER.debug("Consumer #{} - Session created", workerId);
@@ -383,7 +382,7 @@ public class SapAmqpConnectorMessageSource extends Source<Object, MessageAttribu
 
                 // Manual acknowledgment if CLIENT mode
                 if (ackMode == Session.CLIENT_ACKNOWLEDGE) {
-                    message.acknowledge();
+//                    message.acknowledge();
                     LOGGER.debug("Consumer #{} - Message acknowledged", workerId);
                 }
 
@@ -818,9 +817,9 @@ public class SapAmqpConnectorMessageSource extends Source<Object, MessageAttribu
             case CLIENT:
                 LOGGER.info("Using CLIENT_ACKNOWLEDGE mode");
                 return Session.CLIENT_ACKNOWLEDGE;
-            case DUPS_OK:
-                LOGGER.info("Using DUPS_OK_ACKNOWLEDGE mode");
-                return Session.DUPS_OK_ACKNOWLEDGE;
+//            case DUPS_OK:
+//                LOGGER.info("Using DUPS_OK_ACKNOWLEDGE mode");
+//                return Session.DUPS_OK_ACKNOWLEDGE;
             case AUTO:
             default:
                 LOGGER.info("Using AUTO_ACKNOWLEDGE mode");
