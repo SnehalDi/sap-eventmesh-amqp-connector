@@ -16,6 +16,9 @@ import org.mule.runtime.api.metadata.DataType;
 import org.mule.runtime.extension.api.annotation.metadata.OutputResolver;
 
 import jakarta.jms.*;
+import org.apache.qpid.jms.message.JmsMessage; 
+import org.apache.qpid.jms.provider.amqp.message.AmqpJmsMessageFacade;
+//remove later
 import org.apache.qpid.jms.JmsConnectionFactory;
 import org.mule.runtime.api.connection.ConnectionException;
 
@@ -24,8 +27,11 @@ import org.slf4j.LoggerFactory;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.util.List;
+import java.util.Enumeration;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 import java.net.URI;
 import java.net.URLEncoder;
 import java.io.InputStream;
@@ -290,35 +296,270 @@ public class SapAmqpConnectorOperations {
     }
 
     private byte[] extractPayloadAsBytes(Message message) throws Exception {
+        LOGGER.debug("Message type: {}", message.getClass().getName());
+        
+        // Extract and log AMQP properties using helper method
+        extractAndLogAmqpProperties(message);
+        
+        // Extract payload based on JMS message type
         if (message instanceof BytesMessage) {
             BytesMessage bytesMessage = (BytesMessage) message;
             long bodyLength = bytesMessage.getBodyLength();
+            
+            LOGGER.info("=== BytesMessage Detected ===");
+            LOGGER.info("Body length: {} bytes", bodyLength);
+            
             if (bodyLength > Integer.MAX_VALUE) {
                 throw new RuntimeException("Message too large: " + bodyLength + " bytes");
             }
+            
+            if (bodyLength == 0) {
+                LOGGER.warn("BytesMessage has zero length body");
+                return new byte[0];
+            }
+            
             byte[] bytes = new byte[(int) bodyLength];
-            bytesMessage.readBytes(bytes);
-            LOGGER.debug("Extracted {} bytes from BytesMessage", bytes.length);
+            int bytesRead = bytesMessage.readBytes(bytes);
+            
+            LOGGER.info("Extracted {} bytes from BytesMessage", bytesRead);
             return bytes;
+            
         } else if (message instanceof TextMessage) {
-            String text = ((TextMessage) message).getText();
-            byte[] bytes = text != null ? text.getBytes(StandardCharsets.UTF_8) : new byte[0];
-            LOGGER.info("Extracted {} bytes from TextMessage", bytes.length); //changed to info
+            TextMessage textMessage = (TextMessage) message;
+            String text = textMessage.getText();
+            
+            LOGGER.info("=== TextMessage Detected ===");
+            
+            if (text == null) {
+                LOGGER.warn("TextMessage has null content");
+                return new byte[0];
+            }
+            
+            // Log preview of text content
+            String preview = text.length() > 100 ? text.substring(0, 100) + "..." : text;
+            LOGGER.info("Text content preview: {}", preview);
+            LOGGER.info("Text content length: {} characters", text.length());
+            
+            // Convert text to bytes using UTF-8
+            byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
+            LOGGER.info("Extracted {} bytes from TextMessage", bytes.length);
+            
             return bytes;
+            
         } else if (message instanceof ObjectMessage) {
-            Object obj = ((ObjectMessage) message).getObject();
-            String text = obj != null ? obj.toString() : "";
-            byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
-            LOGGER.debug("Extracted {} bytes from ObjectMessage", bytes.length);
+            ObjectMessage objMessage = (ObjectMessage) message;
+            Object obj = objMessage.getObject();
+            
+            LOGGER.info("ObjectMessage detected");
+            
+            if (obj == null) {
+                LOGGER.warn("ObjectMessage has null content");
+                return new byte[0];
+            }
+            
+            // Handle different object types
+            if (obj instanceof byte[]) {
+                byte[] bytes = (byte[]) obj;
+                LOGGER.info("ObjectMessage contains byte array of {} bytes", bytes.length);
+                return bytes;
+            } else if (obj instanceof String) {
+                String text = (String) obj;
+                byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
+                LOGGER.info("ObjectMessage contains String of {} characters ({} bytes)", 
+                    text.length(), bytes.length);
+                return bytes;
+            } else {
+                // Serialize to JSON
+                LOGGER.info("ObjectMessage contains {} object, serializing to JSON", 
+                    obj.getClass().getSimpleName());
+                String json = objectMapper.writeValueAsString(obj);
+                return json.getBytes(StandardCharsets.UTF_8);
+            }
+            
+        } else if (message instanceof MapMessage) {
+            MapMessage mapMessage = (MapMessage) message;
+            
+            LOGGER.info("MapMessage detected, converting to JSON");
+            
+            // Convert MapMessage to JSON
+            Map<String, Object> map = new HashMap<>();
+            Enumeration<?> mapNames = mapMessage.getMapNames();
+            
+            while (mapNames.hasMoreElements()) {
+                String name = (String) mapNames.nextElement();
+                map.put(name, mapMessage.getObject(name));
+            }
+            
+            String json = objectMapper.writeValueAsString(map);
+            byte[] bytes = json.getBytes(StandardCharsets.UTF_8);
+            LOGGER.info("Extracted {} bytes from MapMessage (converted to JSON)", bytes.length);
+            
             return bytes;
-        } else {
+            
+        } else if (message instanceof StreamMessage) {
+            LOGGER.warn("StreamMessage detected - not fully supported, converting to string");
             String text = message.toString();
-            byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
-            LOGGER.debug("Extracted {} bytes from generic Message", bytes.length);
-            return bytes;
+            return text.getBytes(StandardCharsets.UTF_8);
+            
+        } else {
+            LOGGER.warn("Unknown message type: {}, using toString()", message.getClass().getName());
+            String text = message.toString();
+            return text.getBytes(StandardCharsets.UTF_8);
         }
     }
 
+    /**
+     * Extracts and logs all AMQP properties from the message facade.
+     * This method works for all JmsMessage types (TextMessage, BytesMessage, ObjectMessage, etc.)
+     * as they all extend JmsMessage and have access to the AMQP facade.
+     * 
+     * @param message The JMS message to extract properties from
+     */
+    private void extractAndLogAmqpProperties(Message message) {
+        
+        try {
+            JmsMessage jmsMessage = (JmsMessage) message;
+            AmqpJmsMessageFacade facade = (AmqpJmsMessageFacade) jmsMessage.getFacade();
+            
+            LOGGER.info("==========================================");
+            LOGGER.info("AMQP MESSAGE PROPERTIES (via Facade)");
+            LOGGER.info("==========================================");
+            
+            // Log AMQP standard properties
+            LOGGER.info("--- AMQP Standard Properties ---");
+            logProperty("Content-Type", facade.getContentType());
+//            logProperty("Content-Encoding", facade.getContentEncoding());
+            logProperty("Message-ID", facade.getMessageId());
+            logProperty("Correlation-ID", facade.getCorrelationId());
+           // logProperty("Subject", facade.getSubject());
+            logProperty("User-ID", facade.getUserId());
+            logProperty("Group-ID", facade.getGroupId());
+            logProperty("Group-Sequence", facade.getGroupSequence());
+            logProperty("Reply-To-Group-ID", facade.getReplyToGroupId());
+            
+           
+            
+//            try {
+//                long expiryTime = facade.getAbsoluteExpiryTime();
+//                if (expiryTime > 0) {
+//                    LOGGER.info("Absolute-Expiry-Time: {} ({})", expiryTime,
+//                        new java.util.Date(expiryTime));
+//                }
+//            } catch (Exception e) {
+//                LOGGER.debug("Expiry time not available");
+//            }
+            
+            // Log all application properties
+            LOGGER.info("--- Application Properties ---");
+            Set<String> propertyNames = new HashSet<>();
+            facade.getApplicationPropertyNames(propertyNames);
+            
+            if (propertyNames.isEmpty()) {
+                LOGGER.info("No application properties found");
+            } else {
+                LOGGER.info("Found {} application properties:", propertyNames.size());
+                for (String name : propertyNames) {
+                    Object value = facade.getApplicationProperty(name);
+                    String valueType = value != null ? value.getClass().getSimpleName() : "null";
+                    LOGGER.info("  {} = {} ({})", name, value, valueType);
+                }
+            }
+            
+            LOGGER.info("==========================================");
+            
+        } catch (ClassCastException e) {
+            LOGGER.warn("Message facade is not AmqpJmsMessageFacade: {}", e.getMessage());
+        } catch (Exception e) {
+            LOGGER.warn("Error accessing AMQP message properties: {}", e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Helper method to log a property with null-safe handling
+     */
+    private void logProperty(String name, Object value) {
+        if (value != null) {
+            LOGGER.info("{}: {}", name, value);
+        } else {
+            LOGGER.debug("{}: <not set>", name);
+        }
+    }
+
+    /**
+     * Extracts AMQP properties from the message facade and returns them as a Map.
+     * This is useful for storing in MessageAttributes or for programmatic access.
+     * 
+     * @param message The JMS message to extract properties from
+     * @return Map of AMQP properties, or empty map if not accessible
+     */
+//    private Map<String, Object> getAmqpPropertiesMap(Message message) {
+//        Map<String, Object> amqpProperties = new HashMap<>();
+//        
+//        
+//        try {
+//            JmsMessage jmsMessage = (JmsMessage) message;
+//            AmqpJmsMessageFacade facade = (AmqpJmsMessageFacade) jmsMessage.getFacade();
+//            
+//            // Standard AMQP properties
+//            if (facade.getContentType() != null) {
+//                amqpProperties.put("contentType", facade.getContentType());
+//            }
+////            if (facade.getContentEncoding() != null) {
+////                amqpProperties.put("contentEncoding", facade.getContentEncoding());
+////            }
+//            if (facade.getMessageId() != null) {
+//                amqpProperties.put("messageId", facade.getMessageId());
+//            }
+//            if (facade.getCorrelationId() != null) {
+//                amqpProperties.put("correlationId", facade.getCorrelationId());
+//            }
+////            if (facade.getSubject() != null) {
+////                amqpProperties.put("subject", facade.getSubject());
+////            }
+//            if (facade.getUserId() != null) {
+//                amqpProperties.put("userId", facade.getUserId());
+//            }
+//            if (facade.getGroupId() != null) {
+//                amqpProperties.put("groupId", facade.getGroupId());
+//            }
+//            amqpProperties.put("groupSequence", facade.getGroupSequence());
+//            if (facade.getReplyToGroupId() != null) {
+//                amqpProperties.put("replyToGroupId", facade.getReplyToGroupId());
+//            }
+//            
+//            // Timestamps
+////            long creationTime = facade.getCreationTime();
+////            if (creationTime > 0) {
+////                amqpProperties.put("creationTime", creationTime);
+////            }
+////            
+////            long expiryTime = facade.getAbsoluteExpiryTime();
+////            if (expiryTime > 0) {
+////                amqpProperties.put("absoluteExpiryTime", expiryTime);
+////            }
+//            
+//            // Application properties
+//            Set<String> propertyNames = new HashSet<>();
+//            facade.getApplicationPropertyNames(propertyNames);
+//            
+//            if (!propertyNames.isEmpty()) {
+//                Map<String, Object> appProps = new HashMap<>();
+//                for (String name : propertyNames) {
+//                    Object value = facade.getApplicationProperty(name);
+//                    appProps.put(name, value);
+//                }
+//                amqpProperties.put("applicationProperties", appProps);
+//            }
+//            
+//        } catch (Exception e) {
+//            LOGGER.debug("Could not extract AMQP properties: {}", e.getMessage());
+//        }
+//        
+//        return amqpProperties;
+//    }
+//    
+    
+    
     private org.mule.runtime.api.metadata.MediaType extractMediaType(Message message) {
         try {
             // Check for AMQP 1.0 content-type property (standard for SAP Event Mesh and all AMQP clients)
@@ -528,7 +769,7 @@ public class SapAmqpConnectorOperations {
             LOGGER.debug("Could not extract MIME type property: {}", e.getMessage());
         }
 
-        // Custom properties
+        // Custom properties - avoid
         Map<String, Object> customProperties = new HashMap<>();
         java.util.Enumeration<?> propertyNames = message.getPropertyNames();
         while (propertyNames.hasMoreElements()) {
