@@ -1,4 +1,3 @@
-
 package com.mycompany.mule.connectors.sapAMQPConnector.internal;
 
 import static org.mule.runtime.extension.api.annotation.param.MediaType.ANY;
@@ -201,6 +200,151 @@ public class SapAmqpConnectorOperations {
         } finally {
             closeResources(consumer, session, connection);
         }
+    }
+
+    // ========================================================================
+    // ACKNOWLEDGMENT OPERATIONS (CLIENT MODE)
+    // ========================================================================
+    
+    /**
+     * Acknowledge a message in CLIENT mode
+     * 
+     * @param acknowledgmentId The acknowledgment ID from the message attributes
+     * @param connection The connection (not actively used but required for operation binding)
+     */
+    @DisplayName("Acknowledge Message")
+    @Summary("Acknowledges a message that was received in CLIENT acknowledgment mode")
+    @MediaType(value = ANY, strict = false)
+    public void acknowledgeMessage(
+            @DisplayName("Acknowledgment ID")
+            @Summary("The acknowledgment ID from the message attributes")
+            String acknowledgmentId,
+            
+            @Connection
+            SapAmqpConnectorConnection connection) {
+        
+        LOGGER.info("=== Acknowledging Message ===");
+        LOGGER.info("Acknowledgment ID: {}", acknowledgmentId);
+        
+        if (acknowledgmentId == null || acknowledgmentId.trim().isEmpty()) {
+            String errorMsg = "Acknowledgment ID is required";
+            LOGGER.error(errorMsg);
+            throw new RuntimeException(errorMsg);
+        }
+        
+        // Retrieve pending acknowledgment from registry
+        AcknowledgmentRegistry registry = AcknowledgmentRegistry.getInstance();
+        AcknowledgmentRegistry.PendingAcknowledgment pending = registry.getPendingAcknowledgment(acknowledgmentId);
+        
+        if (pending == null) {
+            String errorMsg = "No pending acknowledgment found for ID: " + acknowledgmentId + 
+                            ". The message may have already been acknowledged or the ID is invalid.";
+            LOGGER.error(errorMsg);
+            throw new RuntimeException(errorMsg);
+        }
+        
+        try {
+            Message message = pending.getMessage();
+            
+            LOGGER.debug("Pending acknowledgment age: {} seconds", pending.getAgeInSeconds());
+            LOGGER.debug("Message ID: {}", message.getJMSMessageID());
+            
+            // Acknowledge the message
+            message.acknowledge();
+            
+            LOGGER.info("Message acknowledged successfully");
+            LOGGER.info("Acknowledgment ID: {}", acknowledgmentId);
+            
+            // Remove from registry
+            registry.removePendingAcknowledgment(acknowledgmentId);
+            
+        } catch (JMSException e) {
+            String errorMsg = "Failed to acknowledge message with ID: " + acknowledgmentId + " - " + e.getMessage();
+            LOGGER.error(errorMsg, e);
+            throw new RuntimeException(errorMsg, e);
+        }
+    }
+    
+    /**
+     * Reject (nack) a message in CLIENT mode
+     * Note: With INDIVIDUAL_ACKNOWLEDGE mode, this simply doesn't acknowledge the message.
+     * The message will be redelivered by SAP Event Mesh after a timeout.
+     * Other messages are NOT affected.
+     * 
+     * @param acknowledgmentId The acknowledgment ID from the message attributes
+     * @param connection The connection (not actively used but required for operation binding)
+     */
+    @DisplayName("Reject Message (Nack)")
+    @Summary("Rejects a message in CLIENT mode, causing it to be redelivered (other messages NOT affected)")
+    @MediaType(value = ANY, strict = false)
+    public void rejectMessage(
+            @DisplayName("Acknowledgment ID")
+            @Summary("The acknowledgment ID from the message attributes")
+            String acknowledgmentId,
+            
+            @Connection
+            SapAmqpConnectorConnection connection) {
+        
+        LOGGER.info("=== Rejecting Message (Nack) ===");
+        LOGGER.info("Acknowledgment ID: {}", acknowledgmentId);
+        
+        if (acknowledgmentId == null || acknowledgmentId.trim().isEmpty()) {
+            String errorMsg = "Acknowledgment ID is required";
+            LOGGER.error(errorMsg);
+            throw new RuntimeException(errorMsg);
+        }
+        
+        // Retrieve pending acknowledgment from registry
+        AcknowledgmentRegistry registry = AcknowledgmentRegistry.getInstance();
+        AcknowledgmentRegistry.PendingAcknowledgment pending = registry.getPendingAcknowledgment(acknowledgmentId);
+        
+        if (pending == null) {
+            String errorMsg = "No pending acknowledgment found for ID: " + acknowledgmentId + 
+                            ". The message may have already been processed or the ID is invalid.";
+            LOGGER.error(errorMsg);
+            throw new RuntimeException(errorMsg);
+        }
+        
+        try {
+            Message message = pending.getMessage();
+            
+            LOGGER.debug("Pending acknowledgment age: {} seconds", pending.getAgeInSeconds());
+            LOGGER.debug("Message ID: {}", message.getJMSMessageID());
+            
+            // With INDIVIDUAL_ACKNOWLEDGE mode:
+            // - We simply do NOT acknowledge the message
+            // - No session.recover() needed (would affect other messages)
+            // - SAP Event Mesh will redeliver this specific message after timeout
+            // - Other messages in the session are NOT affected
+            
+            LOGGER.info("Message NOT acknowledged (rejected)");
+            LOGGER.info("Message will be redelivered by SAP Event Mesh after timeout");
+            LOGGER.info("Other messages are NOT affected (INDIVIDUAL_ACKNOWLEDGE mode)");
+            LOGGER.info("Acknowledgment ID: {}", acknowledgmentId);
+            
+            // Remove from registry (we're done with it)
+            registry.removePendingAcknowledgment(acknowledgmentId);
+            
+        } catch (JMSException e) {
+            String errorMsg = "Failed to reject message with ID: " + acknowledgmentId + " - " + e.getMessage();
+            LOGGER.error(errorMsg, e);
+            throw new RuntimeException(errorMsg, e);
+        }
+    }
+    
+    /**
+     * Get the count of pending acknowledgments (useful for monitoring)
+     * 
+     * @param connection The connection (not actively used but required for operation binding)
+     * @return The number of messages waiting for acknowledgment
+     */
+    @DisplayName("Get Pending Acknowledgment Count")
+    @Summary("Returns the number of messages waiting for acknowledgment in CLIENT mode")
+    @MediaType(value = ANY, strict = false)
+    public int getPendingAcknowledgmentCount(@Connection SapAmqpConnectorConnection connection) {
+        int count = AcknowledgmentRegistry.getInstance().getPendingCount();
+        LOGGER.debug("Pending acknowledgments: {}", count);
+        return count;
     }
 
     // ========================================================================
@@ -825,6 +969,115 @@ public class SapAmqpConnectorOperations {
             LOGGER.debug("JMS Connection closed"); 
         } catch (Exception e) { 
             LOGGER.error("Error closing connection", e); 
+        }
+    }
+    
+    // ========================================================================
+    // INNER CLASS: Acknowledgment Registry
+    // ========================================================================
+    
+    /**
+     * Registry for managing pending message acknowledgments in CLIENT mode.
+     * Stores JMS Message and Session references for later acknowledge/nack operations.
+     * Singleton pattern for thread-safe access across the connector.
+     */
+    public static class AcknowledgmentRegistry {
+        
+        private static final Logger LOGGER = LoggerFactory.getLogger(AcknowledgmentRegistry.class);
+        
+        // Singleton instance
+        private static final AcknowledgmentRegistry INSTANCE = new AcknowledgmentRegistry();
+        
+        // Storage for pending acknowledgments
+        private final Map<String, PendingAcknowledgment> pendingAcks = new java.util.concurrent.ConcurrentHashMap<>();
+        
+        private AcknowledgmentRegistry() {
+            // Private constructor for singleton
+        }
+        
+        public static AcknowledgmentRegistry getInstance() {
+            return INSTANCE;
+        }
+        
+        /**
+         * Register a message for acknowledgment and return a unique acknowledgment ID
+         */
+        public String registerMessage(Message message, Session session) {
+            String ackId = java.util.UUID.randomUUID().toString();
+            PendingAcknowledgment pending = new PendingAcknowledgment(message, session);
+            pendingAcks.put(ackId, pending);
+            
+            LOGGER.debug("Registered message for acknowledgment with ID: {}", ackId);
+            LOGGER.debug("Total pending acknowledgments: {}", pendingAcks.size());
+            
+            return ackId;
+        }
+        
+        /**
+         * Get a pending acknowledgment by ID
+         */
+        public PendingAcknowledgment getPendingAcknowledgment(String ackId) {
+            return pendingAcks.get(ackId);
+        }
+        
+        /**
+         * Remove a pending acknowledgment after it has been processed
+         */
+        public void removePendingAcknowledgment(String ackId) {
+            PendingAcknowledgment removed = pendingAcks.remove(ackId);
+            if (removed != null) {
+                LOGGER.debug("Removed pending acknowledgment with ID: {}", ackId);
+                LOGGER.debug("Remaining pending acknowledgments: {}", pendingAcks.size());
+            } else {
+                LOGGER.warn("Attempted to remove non-existent acknowledgment ID: {}", ackId);
+            }
+        }
+        
+        /**
+         * Clear all pending acknowledgments (typically on shutdown)
+         */
+        public void clearAll() {
+            int count = pendingAcks.size();
+            pendingAcks.clear();
+            LOGGER.info("Cleared {} pending acknowledgments", count);
+        }
+        
+        /**
+         * Get the count of pending acknowledgments
+         */
+        public int getPendingCount() {
+            return pendingAcks.size();
+        }
+        
+        /**
+         * Inner class to hold message and session references
+         */
+        public static class PendingAcknowledgment {
+            private final Message message;
+            private final Session session;
+            private final long registeredTime;
+            
+            public PendingAcknowledgment(Message message, Session session) {
+                this.message = message;
+                this.session = session;
+                this.registeredTime = System.currentTimeMillis();
+            }
+            
+            public Message getMessage() {
+                return message;
+            }
+            
+            public Session getSession() {
+                return session;
+            }
+            
+            public long getRegisteredTime() {
+                return registeredTime;
+            }
+            
+            public long getAgeInSeconds() {
+                return (System.currentTimeMillis() - registeredTime) / 1000;
+            }
         }
     }
 }

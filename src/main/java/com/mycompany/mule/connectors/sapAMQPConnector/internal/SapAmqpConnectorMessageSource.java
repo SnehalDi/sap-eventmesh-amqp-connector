@@ -77,6 +77,11 @@ public class SapAmqpConnectorMessageSource extends Source<Object, MessageAttribu
     // JMS property key for AMQP content-type
     private static final String JMS_AMQP_CONTENT_TYPE = "JMS_AMQP_CONTENT_TYPE";
     
+    // Qpid JMS INDIVIDUAL_ACKNOWLEDGE mode constant (Qpid-specific extension)
+    // This is a non-standard JMS mode provided by Apache Qpid JMS that allows
+    // acknowledging messages individually without affecting other messages in the session
+    private static final int INDIVIDUAL_ACKNOWLEDGE = 101;
+    
     @Config
     private SapAmqpConnectorConfiguration config;
 
@@ -122,7 +127,7 @@ public class SapAmqpConnectorMessageSource extends Source<Object, MessageAttribu
     @Parameter
     @Optional(defaultValue = "AUTO")
     @DisplayName("Acknowledgment Mode")
-    @Summary("Message acknowledgment mode")
+    @Summary("Message acknowledgment mode: AUTO (automatic) or CLIENT (manual via separate operation)")
     private AcknowledgmentMode ackMode;
 
     @Parameter
@@ -142,6 +147,7 @@ public class SapAmqpConnectorMessageSource extends Source<Object, MessageAttribu
         LOGGER.debug("Token URL: {}", tokenUrl);
         LOGGER.debug("Client ID: {}", clientId);
         LOGGER.debug("Queue Name: {}", queueName);
+        LOGGER.info("Acknowledgment Mode: {}", ackMode);
         
         running.set(true);
 
@@ -179,6 +185,15 @@ public class SapAmqpConnectorMessageSource extends Source<Object, MessageAttribu
 
             // Determine acknowledgment mode
             int sessionAckMode = getAcknowledgmentMode();
+            
+            if (ackMode == AcknowledgmentMode.CLIENT) {
+                LOGGER.warn("===================================================================");
+                LOGGER.warn("CLIENT ACKNOWLEDGMENT MODE ENABLED");
+                LOGGER.warn("Messages will NOT be automatically acknowledged!");
+                LOGGER.warn("Use 'Acknowledge Message' or 'Reject Message' operations to handle messages");
+                LOGGER.warn("Acknowledgment ID will be available in message attributes");
+                LOGGER.warn("===================================================================");
+            }
 
             // Start consumer threads
             for (int i = 0; i < numberOfConsumers; i++) {
@@ -188,6 +203,7 @@ public class SapAmqpConnectorMessageSource extends Source<Object, MessageAttribu
                     sourceCallback, 
                     sessionAckMode,
                     messageSelector,
+                    ackMode == AcknowledgmentMode.CLIENT,
                     i + 1
                 );
                 consumers.add(worker);
@@ -242,6 +258,12 @@ public class SapAmqpConnectorMessageSource extends Source<Object, MessageAttribu
             }
             jmsConnection = null;
         }
+        
+        // Clear pending acknowledgments if in CLIENT mode
+        if (ackMode == AcknowledgmentMode.CLIENT) {
+            SapAmqpConnectorOperations.AcknowledgmentRegistry.getInstance().clearAll();
+            LOGGER.info("Cleared all pending acknowledgments");
+        }
 
         LOGGER.info("Message Listener stopped successfully");
     }
@@ -255,17 +277,20 @@ public class SapAmqpConnectorMessageSource extends Source<Object, MessageAttribu
         private final SourceCallback<Object, MessageAttributes> callback;
         private final int sessionAckMode;
         private final String selector;
+        private final boolean isClientAckMode;
         private final int workerId;
         private volatile boolean active = true;
 
         public ConsumerWorker(jakarta.jms.Connection jmsConn, String queueName, 
                             SourceCallback<Object, MessageAttributes> callback,
-                            int sessionAckMode, String selector, int workerId) {
+                            int sessionAckMode, String selector, 
+                            boolean isClientAckMode, int workerId) {
             this.jmsConn = jmsConn;
             this.queueName = queueName;
             this.callback = callback;
             this.sessionAckMode = sessionAckMode;
             this.selector = selector;
+            this.isClientAckMode = isClientAckMode;
             this.workerId = workerId;
         }
 
@@ -334,6 +359,8 @@ public class SapAmqpConnectorMessageSource extends Source<Object, MessageAttribu
          * Process received JMS message and invoke callback
          */
         private void processMessage(Message message, Session session, int ackMode) {
+            String acknowledgmentId = null;
+            
             try {
                 LOGGER.debug("Consumer #{} - Message received", workerId);
 
@@ -342,6 +369,21 @@ public class SapAmqpConnectorMessageSource extends Source<Object, MessageAttribu
                 
                 // Extract message attributes (including AMQP properties)
                 MessageAttributes attributes = extractMessageAttributes(message);
+                
+                // Handle CLIENT acknowledgment mode
+                if (isClientAckMode) {
+                    // Register message for acknowledgment and get unique ID
+                    acknowledgmentId = SapAmqpConnectorOperations.AcknowledgmentRegistry
+                        .getInstance().registerMessage(message, session);
+                    attributes.setackId(acknowledgmentId);
+                    attributes.setRequiresAcknowledgment(true);
+                    
+                    LOGGER.info("Consumer #{} - CLIENT mode: Message registered for acknowledgment", workerId);
+                    LOGGER.info("Consumer #{} - Acknowledgment ID: {}", workerId, acknowledgmentId);
+                    LOGGER.warn("Consumer #{} - Message will NOT be auto-acknowledged - use Acknowledge/Reject operations", workerId);
+                } else {
+                    attributes.setRequiresAcknowledgment(false);
+                }
                 
                 // Get content-type from attributes (extracted from AMQP properties)
                 String contentType = attributes.getContentType();
@@ -361,11 +403,12 @@ public class SapAmqpConnectorMessageSource extends Source<Object, MessageAttribu
                     outputMediaType = org.mule.runtime.api.metadata.MediaType.ANY;
                 }
                 
-                LOGGER.info("Consumer #{} - Processing message [ID: {}, Content-Type: {}, Size: {} bytes]", 
+                LOGGER.info("Consumer #{} - Processing message [ID: {}, Content-Type: {}, Size: {} bytes, AckMode: {}]", 
                     workerId, 
                     attributes.getMessageId(), 
                     contentType,
-                    payloadBytes.length);
+                    payloadBytes.length,
+                    isClientAckMode ? "CLIENT" : "AUTO");
                 
                 // Parse payload based on content type from AMQP properties
                 Object outputPayload = parsePayload(payloadBytes, outputMediaType);
@@ -380,25 +423,41 @@ public class SapAmqpConnectorMessageSource extends Source<Object, MessageAttribu
                 // Invoke callback to pass message to Mule flow
                 callback.handle(result);
 
-                // Manual acknowledgment if CLIENT mode
-                if (ackMode == Session.CLIENT_ACKNOWLEDGE) {
-//                    message.acknowledge();
-                    LOGGER.debug("Consumer #{} - Message acknowledged", workerId);
-                }
-
+                // NOTE: In CLIENT mode with INDIVIDUAL_ACKNOWLEDGE:
+                // - Message is NOT auto-acknowledged
+                // - Must explicitly call acknowledge-message operation
+                // - Each message is independent (no grouping)
+                
                 LOGGER.info("Consumer #{} - Message processed successfully", workerId);
+                
+                if (isClientAckMode) {
+                    LOGGER.info("Consumer #{} - Waiting for manual acknowledgment via Acknowledge/Reject operation", workerId);
+                    LOGGER.debug("Consumer #{} - Using INDIVIDUAL_ACKNOWLEDGE - this message is independent of others", workerId);
+                }
 
             } catch (Exception e) {
                 LOGGER.error("Consumer #{} - Error processing message", workerId, e);
                 
-                // On error, try to recover session
-                try {
-                    if (ackMode == Session.CLIENT_ACKNOWLEDGE) {
-                        session.recover();
-                        LOGGER.info("Consumer #{} - Session recovered", workerId);
-                    }
-                } catch (JMSException ex) {
-                    LOGGER.error("Consumer #{} - Failed to recover session", workerId, ex);
+                // Clean up acknowledgment registration if message processing failed
+                if (isClientAckMode && acknowledgmentId != null) {
+                    LOGGER.warn("Consumer #{} - Removing acknowledgment registration due to processing error", workerId);
+                    SapAmqpConnectorOperations.AcknowledgmentRegistry
+                        .getInstance().removePendingAcknowledgment(acknowledgmentId);
+                }
+                
+                // NOTE: In CLIENT mode with INDIVIDUAL_ACKNOWLEDGE:
+                // - We do NOT call session.recover() (would affect other messages)
+                // - The message remains unacknowledged
+                // - SAP Event Mesh will redeliver it after a timeout
+                // - Other messages in the session are NOT affected
+                
+                if (isClientAckMode) {
+                    LOGGER.warn("Consumer #{} - CLIENT mode: Message NOT acknowledged due to error", workerId);
+                    LOGGER.warn("Consumer #{} - Message will be redelivered by SAP Event Mesh after timeout", workerId);
+                    LOGGER.info("Consumer #{} - Other messages are NOT affected (INDIVIDUAL_ACKNOWLEDGE mode)", workerId);
+                } else {
+                    // AUTO mode - message already acknowledged, nothing to do
+                    LOGGER.warn("Consumer #{} - AUTO mode: Message already acknowledged, cannot recover", workerId);
                 }
             }
         }
@@ -809,22 +868,20 @@ public class SapAmqpConnectorMessageSource extends Source<Object, MessageAttribu
      * Get JMS acknowledgment mode from enum parameter
      */
     private int getAcknowledgmentMode() {
-        if (ackMode == null) {
+        if (ackMode == null || ackMode == AcknowledgmentMode.AUTO) {
+            LOGGER.info("Using AUTO_ACKNOWLEDGE mode");
             return Session.AUTO_ACKNOWLEDGE;
         }
-
-        switch (ackMode) {
-            case CLIENT:
-                LOGGER.info("Using CLIENT_ACKNOWLEDGE mode");
-                return Session.CLIENT_ACKNOWLEDGE;
-//            case DUPS_OK:
-//                LOGGER.info("Using DUPS_OK_ACKNOWLEDGE mode");
-//                return Session.DUPS_OK_ACKNOWLEDGE;
-            case AUTO:
-            default:
-                LOGGER.info("Using AUTO_ACKNOWLEDGE mode");
-                return Session.AUTO_ACKNOWLEDGE;
+        
+        if (ackMode == AcknowledgmentMode.CLIENT) {
+            LOGGER.info("Using INDIVIDUAL_ACKNOWLEDGE mode (Qpid JMS) - each message acknowledged independently");
+            LOGGER.debug("INDIVIDUAL_ACKNOWLEDGE constant value: {}", INDIVIDUAL_ACKNOWLEDGE);
+            return INDIVIDUAL_ACKNOWLEDGE;  // Value: 101 (Qpid-specific mode)
         }
+        
+        // Default to AUTO
+        LOGGER.info("Using AUTO_ACKNOWLEDGE mode (default)");
+        return Session.AUTO_ACKNOWLEDGE;
     }
 
     /**

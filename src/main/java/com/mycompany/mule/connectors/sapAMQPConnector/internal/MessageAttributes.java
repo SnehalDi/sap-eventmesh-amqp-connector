@@ -1,8 +1,12 @@
 package com.mycompany.mule.connectors.sapAMQPConnector.internal;
 
+import jakarta.jms.Message;
+import java.io.Serializable;
 import java.util.Map;
 
-public class MessageAttributes {
+public class MessageAttributes implements Serializable {
+    
+    private static final long serialVersionUID = 1L;
     
     // Standard JMS headers
     private String messageId;
@@ -34,7 +38,15 @@ public class MessageAttributes {
     // Custom properties (includes AMQP Application Properties)
     private Map<String, Object> customProperties;
     
-    // Getters and Setters
+    // ========================================================================
+    // NEW: Acknowledgment support for CLIENT mode
+    // ========================================================================
+    private String ackId;  // Unique ID for tracking this message
+    private transient Message jmsMessage;  // Reference to JMS message for ack/nack (not serialized)
+    private boolean requiresAcknowledgment;  // Flag indicating if message needs manual ack
+    // ========================================================================
+    
+    // Getters and Setters for Standard JMS Headers
     
     public String getMessageId() {
         return messageId;
@@ -116,7 +128,7 @@ public class MessageAttributes {
         this.priority = priority;
     }
     
-    // AMQP Standard Properties
+    // Getters and Setters for AMQP Properties
     
     public String getContentType() {
         return contentType;
@@ -158,7 +170,7 @@ public class MessageAttributes {
         this.replyToGroupId = replyToGroupId;
     }
     
-    // Additional metadata
+ // Additional metadata
     
     public String getMessageType() {
         return messageType;
@@ -208,7 +220,7 @@ public class MessageAttributes {
         this.timeout = timeout;
     }
     
-    // Custom Properties (includes AMQP Application Properties)
+    // Getters and Setters for Custom Properties
     
     public Map<String, Object> getCustomProperties() {
         return customProperties;
@@ -216,5 +228,46 @@ public class MessageAttributes {
     
     public void setCustomProperties(Map<String, Object> customProperties) {
         this.customProperties = customProperties;
+    }
+    
+    // Getters and Setters for Acknowledgment Support
+    
+    public String getackId() {
+        return ackId;
+    }
+    
+    public void setackId(String ackId) {
+        this.ackId = ackId;
+    }
+    
+    public Message getJmsMessage() {
+        return jmsMessage;
+    }
+    
+    public void setJmsMessage(Message jmsMessage) {
+        this.jmsMessage = jmsMessage;
+    }
+    
+    public boolean isRequiresAcknowledgment() {
+        return requiresAcknowledgment;
+    }
+    
+    public void setRequiresAcknowledgment(boolean requiresAcknowledgment) {
+        this.requiresAcknowledgment = requiresAcknowledgment;
+    }
+    
+   
+    
+    @Override
+    public String toString() {
+        return "MessageAttributes{" +
+                "messageId='" + messageId + '\'' +
+                ", timestamp=" + timestamp +
+                ", correlationId='" + correlationId + '\'' +
+                ", contentType='" + contentType + '\'' +
+                ", requiresAcknowledgment=" + requiresAcknowledgment +
+                ", ackId='" + ackId + '\'' +
+                ", customPropertiesCount=" + (customProperties != null ? customProperties.size() : 0) +
+                '}';
     }
 }
