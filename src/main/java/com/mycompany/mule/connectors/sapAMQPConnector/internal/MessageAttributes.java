@@ -1,12 +1,11 @@
 package com.mycompany.mule.connectors.sapAMQPConnector.internal;
 
-import jakarta.jms.Message;
-import java.io.Serializable;
 import java.util.Map;
 
-public class MessageAttributes implements Serializable {
-    
-    private static final long serialVersionUID = 1L;
+/**
+ * Message attributes including JMS headers, AMQP properties, and retry metadata
+ */
+public class MessageAttributes {
     
     // Standard JMS headers
     private String messageId;
@@ -20,33 +19,31 @@ public class MessageAttributes implements Serializable {
     private long expiration;
     private int priority;
     
-    // AMQP Standard Properties
+    // AMQP properties
     private String contentType;
     private String userId;
     private String groupId;
     private long groupSequence;
     private String replyToGroupId;
     
-    // Additional metadata
+	  // Additional metadata
     private String messageType;
     private String mimeType;
     private String status;
     private String statusMessage;
     private String errorMessage;
     private Long timeout;
-    
-    // Custom properties (includes AMQP Application Properties)
+	
+    // Custom properties (AMQP application properties + JMS custom properties)
     private Map<String, Object> customProperties;
     
-    // ========================================================================
-    // NEW: Acknowledgment support for CLIENT mode
-    // ========================================================================
-    private String ackId;  // Unique ID for tracking this message
-    private transient Message jmsMessage;  // Reference to JMS message for ack/nack (not serialized)
-    private boolean requiresAcknowledgment;  // Flag indicating if message needs manual ack
-    // ========================================================================
+    // Acknowledgment properties (for CLIENT mode)
+    private String ackId;
+    private boolean requiresAcknowledgment;
     
-    // Getters and Setters for Standard JMS Headers
+
+    
+    // Getters and Setters - Standard JMS Headers
     
     public String getMessageId() {
         return messageId;
@@ -128,7 +125,7 @@ public class MessageAttributes implements Serializable {
         this.priority = priority;
     }
     
-    // Getters and Setters for AMQP Properties
+    // Getters and Setters - AMQP Properties
     
     public String getContentType() {
         return contentType;
@@ -169,7 +166,7 @@ public class MessageAttributes implements Serializable {
     public void setReplyToGroupId(String replyToGroupId) {
         this.replyToGroupId = replyToGroupId;
     }
-    
+	   
  // Additional metadata
     
     public String getMessageType() {
@@ -220,7 +217,7 @@ public class MessageAttributes implements Serializable {
         this.timeout = timeout;
     }
     
-    // Getters and Setters for Custom Properties
+    // Getters and Setters - Custom Properties
     
     public Map<String, Object> getCustomProperties() {
         return customProperties;
@@ -230,7 +227,7 @@ public class MessageAttributes implements Serializable {
         this.customProperties = customProperties;
     }
     
-    // Getters and Setters for Acknowledgment Support
+    // Getters and Setters - Acknowledgment Properties
     
     public String getackId() {
         return ackId;
@@ -240,14 +237,6 @@ public class MessageAttributes implements Serializable {
         this.ackId = ackId;
     }
     
-    public Message getJmsMessage() {
-        return jmsMessage;
-    }
-    
-    public void setJmsMessage(Message jmsMessage) {
-        this.jmsMessage = jmsMessage;
-    }
-    
     public boolean isRequiresAcknowledgment() {
         return requiresAcknowledgment;
     }
@@ -255,8 +244,8 @@ public class MessageAttributes implements Serializable {
     public void setRequiresAcknowledgment(boolean requiresAcknowledgment) {
         this.requiresAcknowledgment = requiresAcknowledgment;
     }
-    
-   
+  
+ 
     
     @Override
     public String toString() {
@@ -264,10 +253,9 @@ public class MessageAttributes implements Serializable {
                 "messageId='" + messageId + '\'' +
                 ", timestamp=" + timestamp +
                 ", correlationId='" + correlationId + '\'' +
+                ", destination='" + destination + '\'' +
                 ", contentType='" + contentType + '\'' +
                 ", requiresAcknowledgment=" + requiresAcknowledgment +
-                ", ackId='" + ackId + '\'' +
-                ", customPropertiesCount=" + (customProperties != null ? customProperties.size() : 0) +
                 '}';
     }
 }

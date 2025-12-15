@@ -77,9 +77,7 @@ public class SapAmqpConnectorMessageSource extends Source<Object, MessageAttribu
     // JMS property key for AMQP content-type
     private static final String JMS_AMQP_CONTENT_TYPE = "JMS_AMQP_CONTENT_TYPE";
     
-    // Qpid JMS INDIVIDUAL_ACKNOWLEDGE mode constant (Qpid-specific extension)
-    // This is a non-standard JMS mode provided by Apache Qpid JMS that allows
-    // acknowledging messages individually without affecting other messages in the session
+    // Qpid JMS INDIVIDUAL_ACKNOWLEDGE mode constant
     private static final int INDIVIDUAL_ACKNOWLEDGE = 101;
     
     @Config
@@ -88,7 +86,6 @@ public class SapAmqpConnectorMessageSource extends Source<Object, MessageAttribu
     @Connection
     private ConnectionProvider<SapAmqpConnectorConnection> connectionProvider;
      
-    
     @Parameter
     @DisplayName("Token URL")
     @Summary("OAuth2 token endpoint URL")
@@ -127,7 +124,7 @@ public class SapAmqpConnectorMessageSource extends Source<Object, MessageAttribu
     @Parameter
     @Optional(defaultValue = "AUTO")
     @DisplayName("Acknowledgment Mode")
-    @Summary("Message acknowledgment mode: AUTO (automatic) or CLIENT (manual via separate operation)")
+    @Summary("AUTO: messages auto-acknowledged (default), CLIENT: manual acknowledgment required")
     private AcknowledgmentMode ackMode;
 
     @Parameter
@@ -148,6 +145,14 @@ public class SapAmqpConnectorMessageSource extends Source<Object, MessageAttribu
         LOGGER.debug("Client ID: {}", clientId);
         LOGGER.debug("Queue Name: {}", queueName);
         LOGGER.info("Acknowledgment Mode: {}", ackMode);
+        
+        if (ackMode == AcknowledgmentMode.CLIENT) {
+            LOGGER.warn("===================================================================");
+            LOGGER.warn("CLIENT ACKNOWLEDGMENT MODE ENABLED");
+            LOGGER.warn("Messages MUST be explicitly acknowledged using 'Acknowledge Message' operation");
+            LOGGER.warn("Unacknowledged messages will be redelivered by the broker");
+            LOGGER.warn("===================================================================");
+        }
         
         running.set(true);
 
@@ -185,15 +190,6 @@ public class SapAmqpConnectorMessageSource extends Source<Object, MessageAttribu
 
             // Determine acknowledgment mode
             int sessionAckMode = getAcknowledgmentMode();
-            
-            if (ackMode == AcknowledgmentMode.CLIENT) {
-                LOGGER.warn("===================================================================");
-                LOGGER.warn("CLIENT ACKNOWLEDGMENT MODE ENABLED");
-                LOGGER.warn("Messages will NOT be automatically acknowledged!");
-                LOGGER.warn("Use 'Acknowledge Message' or 'Reject Message' operations to handle messages");
-                LOGGER.warn("Acknowledgment ID will be available in message attributes");
-                LOGGER.warn("===================================================================");
-            }
 
             // Start consumer threads
             for (int i = 0; i < numberOfConsumers; i++) {
@@ -262,7 +258,7 @@ public class SapAmqpConnectorMessageSource extends Source<Object, MessageAttribu
         // Clear pending acknowledgments if in CLIENT mode
         if (ackMode == AcknowledgmentMode.CLIENT) {
             SapAmqpConnectorOperations.AcknowledgmentRegistry.getInstance().clearAll();
-            LOGGER.info("Cleared all pending acknowledgments");
+            LOGGER.debug("Cleared all pending acknowledgments");
         }
 
         LOGGER.info("Message Listener stopped successfully");
@@ -270,9 +266,10 @@ public class SapAmqpConnectorMessageSource extends Source<Object, MessageAttribu
 
     /**
      * Worker class that consumes messages in a separate thread
+     * CRITICAL FIX: Each worker creates its own session and connection per message in CLIENT mode
      */
     private class ConsumerWorker implements Runnable {
-        private final jakarta.jms.Connection jmsConn;
+        private final jakarta.jms.Connection sharedJmsConn;
         private final String queueName;
         private final SourceCallback<Object, MessageAttributes> callback;
         private final int sessionAckMode;
@@ -281,11 +278,11 @@ public class SapAmqpConnectorMessageSource extends Source<Object, MessageAttribu
         private final int workerId;
         private volatile boolean active = true;
 
-        public ConsumerWorker(jakarta.jms.Connection jmsConn, String queueName, 
+        public ConsumerWorker(jakarta.jms.Connection sharedJmsConn, String queueName, 
                             SourceCallback<Object, MessageAttributes> callback,
                             int sessionAckMode, String selector, 
                             boolean isClientAckMode, int workerId) {
-            this.jmsConn = jmsConn;
+            this.sharedJmsConn = sharedJmsConn;
             this.queueName = queueName;
             this.callback = callback;
             this.sessionAckMode = sessionAckMode;
@@ -296,24 +293,30 @@ public class SapAmqpConnectorMessageSource extends Source<Object, MessageAttribu
 
         @Override
         public void run() {
+            LOGGER.debug("Consumer #{} initializing...", workerId);
+            
+            if (isClientAckMode) {
+                // CLIENT MODE: Create new session/connection for each message
+                runClientMode();
+            } else {
+                // AUTO MODE: Reuse session for all messages
+                runAutoMode();
+            }
+        }
+
+        /**
+         * AUTO mode: Reuse single session for all messages
+         */
+        private void runAutoMode() {
             Session session = null;
             MessageConsumer consumer = null;
 
             try {
-                LOGGER.debug("Consumer #{} initializing...", workerId);
+                LOGGER.debug("Consumer #{} - AUTO mode initializing...", workerId);
                 
-                // Create session
-                session = jmsConn.createSession(
-                    false,
-                    sessionAckMode
-                );
-                LOGGER.debug("Consumer #{} - Session created", workerId);
-
-                // Create queue destination
+                session = sharedJmsConn.createSession(false, sessionAckMode);
                 Destination queue = session.createQueue(queueName);
-                LOGGER.debug("Consumer #{} - Queue destination: {}", workerId, queueName);
-
-                // Create consumer with or without selector
+                
                 if (selector != null && !selector.trim().isEmpty()) {
                     consumer = session.createConsumer(queue, selector);
                     LOGGER.info("Consumer #{} - Created with message selector: {}", workerId, selector);
@@ -322,21 +325,19 @@ public class SapAmqpConnectorMessageSource extends Source<Object, MessageAttribu
                     LOGGER.info("Consumer #{} - Created without message selector", workerId);
                 }
 
-                LOGGER.info("Consumer #{} ready and listening for messages...", workerId);
+                LOGGER.info("Consumer #{} ready and listening for messages (AUTO mode)...", workerId);
 
-                // Message consumption loop
                 while (running.get() && active) {
                     try {
-                        // Receive message with 1 second timeout
                         Message message = consumer.receive(1000);
                         
                         if (message != null) {
-                            processMessage(message, session, sessionAckMode);
+                            processMessageAutoMode(message);
                         }
                     } catch (JMSException e) {
                         if (running.get() && active) {
                             LOGGER.error("Consumer #{} - Error receiving message", workerId, e);
-                            Thread.sleep(1000); // Wait before retry
+                            Thread.sleep(1000);
                         }
                     }
                 }
@@ -344,7 +345,6 @@ public class SapAmqpConnectorMessageSource extends Source<Object, MessageAttribu
             } catch (Exception e) {
                 LOGGER.error("Consumer #{} - Fatal error", workerId, e);
             } finally {
-                // Cleanup resources
                 try {
                     if (consumer != null) consumer.close();
                     if (session != null) session.close();
@@ -356,109 +356,186 @@ public class SapAmqpConnectorMessageSource extends Source<Object, MessageAttribu
         }
 
         /**
-         * Process received JMS message and invoke callback
+         * CLIENT mode: Create dedicated session/connection for each message
+         * This ensures the session remains valid for later acknowledgment
          */
-        private void processMessage(Message message, Session session, int ackMode) {
-            String acknowledgmentId = null;
+        private void runClientMode() {
+            LOGGER.info("Consumer #{} ready and listening for messages (CLIENT mode)...", workerId);
             
-            try {
-                LOGGER.debug("Consumer #{} - Message received", workerId);
-
-                // Extract message payload as bytes
-                byte[] payloadBytes = extractPayloadAsBytes(message);
+            while (running.get() && active) {
+                Session dedicatedSession = null;
+                MessageConsumer dedicatedConsumer = null;
                 
-                // Extract message attributes (including AMQP properties)
-                MessageAttributes attributes = extractMessageAttributes(message);
-                
-                // Handle CLIENT acknowledgment mode
-                if (isClientAckMode) {
-                    // Register message for acknowledgment and get unique ID
-                    acknowledgmentId = SapAmqpConnectorOperations.AcknowledgmentRegistry
-                        .getInstance().registerMessage(message, session);
-                    attributes.setackId(acknowledgmentId);
-                    attributes.setRequiresAcknowledgment(true);
+                try {
+                    // Create dedicated session for this message
+                    dedicatedSession = sharedJmsConn.createSession(false, sessionAckMode);
+                    Destination queue = dedicatedSession.createQueue(queueName);
                     
-                    LOGGER.info("Consumer #{} - CLIENT mode: Message registered for acknowledgment", workerId);
-                    LOGGER.info("Consumer #{} - Acknowledgment ID: {}", workerId, acknowledgmentId);
-                    LOGGER.warn("Consumer #{} - Message will NOT be auto-acknowledged - use Acknowledge/Reject operations", workerId);
-                } else {
-                    attributes.setRequiresAcknowledgment(false);
+                    if (selector != null && !selector.trim().isEmpty()) {
+                        dedicatedConsumer = dedicatedSession.createConsumer(queue, selector);
+                    } else {
+                        dedicatedConsumer = dedicatedSession.createConsumer(queue);
+                    }
+                    
+                    // Receive message with timeout
+                    Message message = dedicatedConsumer.receive(1000);
+                    
+                    if (message != null) {
+                        // Process and register for acknowledgment
+                        // Session ownership transfers to AcknowledgmentRegistry
+                        processMessageClientMode(message, dedicatedSession);
+                        
+                        // DO NOT close session - it's now owned by AcknowledgmentRegistry
+                        dedicatedSession = null;
+                    } else {
+                        // No message, close this session and try again
+                        if (dedicatedConsumer != null) dedicatedConsumer.close();
+                        if (dedicatedSession != null) dedicatedSession.close();
+                    }
+                    
+                } catch (JMSException e) {
+                    if (running.get() && active) {
+                        LOGGER.error("Consumer #{} - Error in CLIENT mode", workerId, e);
+                        
+                        // Clean up on error
+                        try {
+                            if (dedicatedConsumer != null) dedicatedConsumer.close();
+                            if (dedicatedSession != null) dedicatedSession.close();
+                        } catch (Exception cleanupEx) {
+                            LOGGER.debug("Error during cleanup: {}", cleanupEx.getMessage());
+                        }
+                        
+                        try {
+                            Thread.sleep(1000);
+                        } catch (InterruptedException ie) {
+                            break;
+                        }
+                    }
+                } catch (InterruptedException e) {
+                    LOGGER.info("Consumer #{} interrupted", workerId);
+                    break;
                 }
+            }
+            
+            LOGGER.debug("Consumer #{} - CLIENT mode loop exited", workerId);
+        }
+
+        /**
+         * Process message in AUTO mode (message is auto-acknowledged)
+         */
+        private void processMessageAutoMode(Message message) {
+            try {
+                LOGGER.debug("Consumer #{} - Message received (AUTO mode)", workerId);
+
+                byte[] payloadBytes = extractPayloadAsBytes(message);
+                MessageAttributes attributes = extractMessageAttributes(message);
+                attributes.setRequiresAcknowledgment(false);
                 
-                // Get content-type from attributes (extracted from AMQP properties)
                 String contentType = attributes.getContentType();
                 org.mule.runtime.api.metadata.MediaType outputMediaType;
                 
                 if (contentType != null && !contentType.trim().isEmpty()) {
                     try {
                         outputMediaType = org.mule.runtime.api.metadata.MediaType.parse(contentType);
-                        LOGGER.debug("Consumer #{} - Using AMQP content-type: {}", workerId, contentType);
                     } catch (Exception e) {
-                        LOGGER.warn("Consumer #{} - Invalid content-type '{}', defaulting to ANY: {}", 
-                            workerId, contentType, e.getMessage());
                         outputMediaType = org.mule.runtime.api.metadata.MediaType.ANY;
                     }
                 } else {
-                    LOGGER.debug("Consumer #{} - No content-type found, defaulting to ANY", workerId);
                     outputMediaType = org.mule.runtime.api.metadata.MediaType.ANY;
                 }
                 
-                LOGGER.info("Consumer #{} - Processing message [ID: {}, Content-Type: {}, Size: {} bytes, AckMode: {}]", 
-                    workerId, 
-                    attributes.getMessageId(), 
-                    contentType,
-                    payloadBytes.length,
-                    isClientAckMode ? "CLIENT" : "AUTO");
+                LOGGER.info("Consumer #{} - Processing message [ID: {}, Size: {} bytes, Mode: AUTO]", 
+                    workerId, attributes.getMessageId(), payloadBytes.length);
                 
-                // Parse payload based on content type from AMQP properties
                 Object outputPayload = parsePayload(payloadBytes, outputMediaType);
                 
-                // Create result with proper media type
                 Result<Object, MessageAttributes> result = Result.<Object, MessageAttributes>builder()
                     .output(outputPayload)
                     .attributes(attributes)
                     .mediaType(outputMediaType)
                     .build();
 
-                // Invoke callback to pass message to Mule flow
                 callback.handle(result);
+                
+                LOGGER.info("Consumer #{} - Message processed successfully (AUTO acknowledged)", workerId);
 
-                // NOTE: In CLIENT mode with INDIVIDUAL_ACKNOWLEDGE:
-                // - Message is NOT auto-acknowledged
-                // - Must explicitly call acknowledge-message operation
-                // - Each message is independent (no grouping)
+            } catch (Exception e) {
+                LOGGER.error("Consumer #{} - Error processing message", workerId, e);
+            }
+        }
+
+        /**
+         * Process message in CLIENT mode
+         * CRITICAL: Session is NOT closed here - ownership transfers to AcknowledgmentRegistry
+         */
+        private void processMessageClientMode(Message message, Session dedicatedSession) throws InterruptedException {
+            String acknowledgmentId = null;
+            
+            try {
+                LOGGER.debug("Consumer #{} - Message received (CLIENT mode)", workerId);
+
+                byte[] payloadBytes = extractPayloadAsBytes(message);
+                MessageAttributes attributes = extractMessageAttributes(message);
+                
+                // Register message for acknowledgment with its dedicated session
+                // Connection is shared and managed by the Message Source, not per-message
+                acknowledgmentId = SapAmqpConnectorOperations.AcknowledgmentRegistry
+                    .getInstance().registerMessage(message, dedicatedSession);
+                attributes.setackId(acknowledgmentId);
+                attributes.setRequiresAcknowledgment(true);
+                
+                LOGGER.debug("Consumer #{} - CLIENT mode: Message registered for acknowledgment", workerId);
+                LOGGER.debug("Consumer #{} - Acknowledgment ID: {}", workerId, acknowledgmentId);
+                
+                String contentType = attributes.getContentType();
+                org.mule.runtime.api.metadata.MediaType outputMediaType;
+                
+                if (contentType != null && !contentType.trim().isEmpty()) {
+                    try {
+                        outputMediaType = org.mule.runtime.api.metadata.MediaType.parse(contentType);
+                    } catch (Exception e) {
+                        outputMediaType = org.mule.runtime.api.metadata.MediaType.ANY;
+                    }
+                } else {
+                    outputMediaType = org.mule.runtime.api.metadata.MediaType.ANY;
+                }
+                
+                LOGGER.info("Consumer #{} - Processing message [ID: {}, Size: {} bytes, Mode: CLIENT]", 
+                    workerId, attributes.getMessageId(), payloadBytes.length);
+                
+                Object outputPayload = parsePayload(payloadBytes, outputMediaType);
+                
+                Result<Object, MessageAttributes> result = Result.<Object, MessageAttributes>builder()
+                    .output(outputPayload)
+                    .attributes(attributes)
+                    .mediaType(outputMediaType)
+                    .build();
+
+                callback.handle(result);
                 
                 LOGGER.info("Consumer #{} - Message processed successfully", workerId);
-                
-                if (isClientAckMode) {
-                    LOGGER.info("Consumer #{} - Waiting for manual acknowledgment via Acknowledge/Reject operation", workerId);
-                    LOGGER.debug("Consumer #{} - Using INDIVIDUAL_ACKNOWLEDGE - this message is independent of others", workerId);
-                }
+                LOGGER.warn("Consumer #{} - Message awaiting manual acknowledgment", workerId);
 
             } catch (Exception e) {
                 LOGGER.error("Consumer #{} - Error processing message", workerId, e);
                 
-                // Clean up acknowledgment registration if message processing failed
-                if (isClientAckMode && acknowledgmentId != null) {
-                    LOGGER.warn("Consumer #{} - Removing acknowledgment registration due to processing error", workerId);
+                // Clean up acknowledgment registration if processing failed
+                if (acknowledgmentId != null) {
+                    LOGGER.warn("Consumer #{} - Removing acknowledgment registration due to error", workerId);
                     SapAmqpConnectorOperations.AcknowledgmentRegistry
                         .getInstance().removePendingAcknowledgment(acknowledgmentId);
                 }
                 
-                // NOTE: In CLIENT mode with INDIVIDUAL_ACKNOWLEDGE:
-                // - We do NOT call session.recover() (would affect other messages)
-                // - The message remains unacknowledged
-                // - SAP Event Mesh will redeliver it after a timeout
-                // - Other messages in the session are NOT affected
-                
-                if (isClientAckMode) {
-                    LOGGER.warn("Consumer #{} - CLIENT mode: Message NOT acknowledged due to error", workerId);
-                    LOGGER.warn("Consumer #{} - Message will be redelivered by SAP Event Mesh after timeout", workerId);
-                    LOGGER.info("Consumer #{} - Other messages are NOT affected (INDIVIDUAL_ACKNOWLEDGE mode)", workerId);
-                } else {
-                    // AUTO mode - message already acknowledged, nothing to do
-                    LOGGER.warn("Consumer #{} - AUTO mode: Message already acknowledged, cannot recover", workerId);
+                // Close the dedicated session on error
+                try {
+                    if (dedicatedSession != null) {
+                        dedicatedSession.close();
+                    }
+                } catch (Exception closeEx) {
+                    LOGGER.debug("Error closing session: {}", closeEx.getMessage());
                 }
+                
+                LOGGER.warn("Consumer #{} - Message NOT acknowledged - will be redelivered by broker", workerId);
             }
         }
 
@@ -466,178 +543,45 @@ public class SapAmqpConnectorMessageSource extends Source<Object, MessageAttribu
          * Extract payload as byte array from JMS message
          */
         private byte[] extractPayloadAsBytes(Message message) throws Exception {
-            LOGGER.debug("Consumer #{} - Message type: {}", workerId, message.getClass().getName());
-            
-            // Log AMQP properties
-            logAmqpProperties(message);
-            
-            // Extract payload based on JMS message type
             if (message instanceof BytesMessage) {
                 BytesMessage bytesMessage = (BytesMessage) message;
                 long bodyLength = bytesMessage.getBodyLength();
-                
-                LOGGER.debug("Consumer #{} - BytesMessage detected (length: {} bytes)", workerId, bodyLength);
                 
                 if (bodyLength > Integer.MAX_VALUE) {
                     throw new RuntimeException("Message too large: " + bodyLength + " bytes");
                 }
                 
                 if (bodyLength == 0) {
-                    LOGGER.warn("Consumer #{} - BytesMessage has zero length body", workerId);
                     return new byte[0];
                 }
                 
                 byte[] bytes = new byte[(int) bodyLength];
-                int bytesRead = bytesMessage.readBytes(bytes);
-                
-                LOGGER.debug("Consumer #{} - Extracted {} bytes from BytesMessage", workerId, bytesRead);
+                bytesMessage.readBytes(bytes);
                 return bytes;
                 
             } else if (message instanceof TextMessage) {
-                TextMessage textMessage = (TextMessage) message;
-                String text = textMessage.getText();
-                
-                LOGGER.debug("Consumer #{} - TextMessage detected", workerId);
-                
-                if (text == null) {
-                    LOGGER.warn("Consumer #{} - TextMessage has null content", workerId);
-                    return new byte[0];
-                }
-                
-                // Log preview of text content
-                String preview = text.length() > 100 ? text.substring(0, 100) + "..." : text;
-                LOGGER.debug("Consumer #{} - Text preview: {}", workerId, preview);
-                LOGGER.debug("Consumer #{} - Text length: {} characters", workerId, text.length());
-                
-                // Convert text to bytes using UTF-8
-                byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
-                LOGGER.debug("Consumer #{} - Extracted {} bytes from TextMessage", workerId, bytes.length);
-                
-                return bytes;
+                String text = ((TextMessage) message).getText();
+                return text != null ? text.getBytes(StandardCharsets.UTF_8) : new byte[0];
                 
             } else if (message instanceof ObjectMessage) {
-                ObjectMessage objMessage = (ObjectMessage) message;
-                Object obj = objMessage.getObject();
-                
-                LOGGER.debug("Consumer #{} - ObjectMessage detected", workerId);
-                
-                if (obj == null) {
-                    LOGGER.warn("Consumer #{} - ObjectMessage has null content", workerId);
-                    return new byte[0];
-                }
-                
-                // Handle different object types
-                if (obj instanceof byte[]) {
-                    byte[] bytes = (byte[]) obj;
-                    LOGGER.debug("Consumer #{} - ObjectMessage contains byte array of {} bytes", workerId, bytes.length);
-                    return bytes;
-                } else if (obj instanceof String) {
-                    String text = (String) obj;
-                    byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
-                    LOGGER.debug("Consumer #{} - ObjectMessage contains String of {} characters ({} bytes)", 
-                        workerId, text.length(), bytes.length);
-                    return bytes;
-                } else {
-                    // Serialize to JSON
-                    LOGGER.debug("Consumer #{} - ObjectMessage contains {} object, serializing to JSON", 
-                        workerId, obj.getClass().getSimpleName());
-                    String json = objectMapper.writeValueAsString(obj);
-                    return json.getBytes(StandardCharsets.UTF_8);
-                }
+                Object obj = ((ObjectMessage) message).getObject();
+                if (obj == null) return new byte[0];
+                if (obj instanceof byte[]) return (byte[]) obj;
+                if (obj instanceof String) return ((String) obj).getBytes(StandardCharsets.UTF_8);
+                return objectMapper.writeValueAsString(obj).getBytes(StandardCharsets.UTF_8);
                 
             } else if (message instanceof MapMessage) {
                 MapMessage mapMessage = (MapMessage) message;
-                
-                LOGGER.debug("Consumer #{} - MapMessage detected, converting to JSON", workerId);
-                
-                // Convert MapMessage to JSON
                 Map<String, Object> map = new HashMap<>();
                 Enumeration<?> mapNames = mapMessage.getMapNames();
-                
                 while (mapNames.hasMoreElements()) {
                     String name = (String) mapNames.nextElement();
                     map.put(name, mapMessage.getObject(name));
                 }
-                
-                String json = objectMapper.writeValueAsString(map);
-                byte[] bytes = json.getBytes(StandardCharsets.UTF_8);
-                LOGGER.info("Consumer #{} - Extracted {} bytes from MapMessage (converted to JSON)", 
-                    workerId, bytes.length);
-                
-                return bytes;
-                
-            } else if (message instanceof StreamMessage) {
-                LOGGER.warn("Consumer #{} - StreamMessage detected - not fully supported, converting to string", 
-                    workerId);
-                String text = message.toString();
-                return text.getBytes(StandardCharsets.UTF_8);
-                
-            } else {
-                LOGGER.warn("Consumer #{} - Unknown message type: {}, using toString()", 
-                    workerId, message.getClass().getName());
-                String text = message.toString();
-                return text.getBytes(StandardCharsets.UTF_8);
+                return objectMapper.writeValueAsString(map).getBytes(StandardCharsets.UTF_8);
             }
-        }
-
-        /**
-         * Logs AMQP properties from the message facade for debugging purposes.
-         */
-        private void logAmqpProperties(Message message) {
-            try {
-                JmsMessage jmsMessage = (JmsMessage) message;
-                AmqpJmsMessageFacade facade = (AmqpJmsMessageFacade) jmsMessage.getFacade();
-                
-                LOGGER.debug("Consumer #{} - ==========================================", workerId);
-                LOGGER.debug("Consumer #{} - AMQP MESSAGE PROPERTIES", workerId);
-                LOGGER.debug("Consumer #{} - ==========================================", workerId);
-                
-                // Log AMQP standard properties
-                LOGGER.debug("Consumer #{} - --- AMQP Standard Properties ---", workerId);
-                logProperty("Content-Type", facade.getContentType());
-                logProperty("Message-ID", facade.getMessageId());
-                logProperty("Correlation-ID", facade.getCorrelationId());
-                logProperty("User-ID", facade.getUserId());
-                logProperty("Group-ID", facade.getGroupId());
-                logProperty("Group-Sequence", facade.getGroupSequence());
-                logProperty("Reply-To-Group-ID", facade.getReplyToGroupId());
-                
-                // Log all application properties
-                LOGGER.debug("Consumer #{} - --- Application Properties ---", workerId);
-                Set<String> propertyNames = new HashSet<>();
-                facade.getApplicationPropertyNames(propertyNames);
-                
-                if (propertyNames.isEmpty()) {
-                    LOGGER.debug("Consumer #{} - No application properties found", workerId);
-                } else {
-                    LOGGER.debug("Consumer #{} - Found {} application properties:", workerId, propertyNames.size());
-                    for (String name : propertyNames) {
-                        Object value = facade.getApplicationProperty(name);
-                        String valueType = value != null ? value.getClass().getSimpleName() : "null";
-                        LOGGER.info("Consumer #{} -   {} = {} ({})", workerId, name, value, valueType);
-                    }
-                }
-                
-                LOGGER.debug("Consumer #{} - ==========================================", workerId);
-                
-            } catch (ClassCastException e) {
-                LOGGER.warn("Consumer #{} - Message facade is not AmqpJmsMessageFacade: {}", 
-                    workerId, e.getMessage());
-            } catch (Exception e) {
-                LOGGER.warn("Consumer #{} - Error accessing AMQP message properties: {}", 
-                    workerId, e.getMessage(), e);
-            }
-        }
-
-        /**
-         * Helper method to log a property with null-safe handling
-         */
-        private void logProperty(String name, Object value) {
-            if (value != null) {
-                LOGGER.debug("Consumer #{} - {}: {}", workerId, name, value);
-            } else {
-                LOGGER.debug("Consumer #{} - {}: <not set>", workerId, name);
-            }
+            
+            return message.toString().getBytes(StandardCharsets.UTF_8);
         }
 
         /**
@@ -646,79 +590,14 @@ public class SapAmqpConnectorMessageSource extends Source<Object, MessageAttribu
         private Object parsePayload(byte[] payloadBytes, org.mule.runtime.api.metadata.MediaType mediaType) {
             try {
                 String mimeType = mediaType.toRfcString().toLowerCase();
-                LOGGER.debug("Consumer #{} - Parsing payload with MIME type: {}", workerId, mimeType);
                 
-                // Handle JSON content types - return as String for Mule compatibility
-                if (mimeType.contains("application/json") || mimeType.contains("+json")) {
-                    String jsonString = new String(payloadBytes, StandardCharsets.UTF_8);
-                    LOGGER.debug("Consumer #{} - Returning JSON payload as String (size: {} bytes)", 
-                        workerId, payloadBytes.length);
-                    LOGGER.debug("Consumer #{} - Successfully prepared JSON payload", workerId);
-                    return jsonString;
+                if (mimeType.contains("json") || mimeType.contains("xml") || mimeType.startsWith("text/")) {
+                    return new String(payloadBytes, StandardCharsets.UTF_8);
                 }
                 
-                // Handle XML content types
-                if (mimeType.contains("application/xml") || 
-                    mimeType.contains("text/xml") || 
-                    mimeType.contains("+xml")) {
-                    String xmlContent = new String(payloadBytes, StandardCharsets.UTF_8);
-                    LOGGER.debug("Consumer #{} - Returning XML payload as String (size: {} bytes)", 
-                        workerId, payloadBytes.length);
-                    return xmlContent;
-                }
-                
-                // Handle CSV content types
-                if (mimeType.contains("text/csv") || 
-                    mimeType.contains("application/csv")) {
-                    String csvContent = new String(payloadBytes, StandardCharsets.UTF_8);
-                    LOGGER.debug("Consumer #{} - Returning CSV payload as String (size: {} bytes)", 
-                        workerId, payloadBytes.length);
-                    return csvContent;
-                }
-                
-                // Handle plain text content types
-                if (mimeType.contains("text/plain")) {
-                    String textContent = new String(payloadBytes, StandardCharsets.UTF_8);
-                    LOGGER.debug("Consumer #{} - Returning plain text payload as String (size: {} bytes)", 
-                        workerId, payloadBytes.length);
-                    return textContent;
-                }
-                
-                // Handle other text-based content types
-                if (mimeType.startsWith("text/")) {
-                    String textContent = new String(payloadBytes, StandardCharsets.UTF_8);
-                    LOGGER.debug("Consumer #{} - Returning text/* payload as String (size: {} bytes)", 
-                        workerId, payloadBytes.length);
-                    return textContent;
-                }
-                
-                // Handle HTML content types
-                if (mimeType.contains("text/html") || 
-                    mimeType.contains("application/xhtml")) {
-                    String htmlContent = new String(payloadBytes, StandardCharsets.UTF_8);
-                    LOGGER.debug("Consumer #{} - Returning HTML payload as String (size: {} bytes)", 
-                        workerId, payloadBytes.length);
-                    return htmlContent;
-                }
-                
-                // Handle YAML content types
-                if (mimeType.contains("application/yaml") || 
-                    mimeType.contains("application/x-yaml") ||
-                    mimeType.contains("text/yaml")) {
-                    String yamlContent = new String(payloadBytes, StandardCharsets.UTF_8);
-                    LOGGER.debug("Consumer #{} - Returning YAML payload as String (size: {} bytes)", 
-                        workerId, payloadBytes.length);
-                    return yamlContent;
-                }
-                
-                // For binary or unknown types, return as InputStream
-                LOGGER.debug("Consumer #{} - Returning payload as InputStream for binary/unknown content-type: {} (size: {} bytes)", 
-                    workerId, mimeType, payloadBytes.length);
                 return new java.io.ByteArrayInputStream(payloadBytes);
                 
             } catch (Exception e) {
-                LOGGER.warn("Consumer #{} - Failed to parse payload ({}), returning as InputStream: {}", 
-                    workerId, mediaType.toRfcString(), e.getMessage());
                 return new java.io.ByteArrayInputStream(payloadBytes);
             }
         }
@@ -741,103 +620,58 @@ public class SapAmqpConnectorMessageSource extends Source<Object, MessageAttribu
             attributes.setExpiration(message.getJMSExpiration());
             attributes.setPriority(message.getJMSPriority());
             
-            // Extract AMQP properties and add to attributes
+            // Extract AMQP properties
             try {
                 JmsMessage jmsMessage = (JmsMessage) message;
                 AmqpJmsMessageFacade facade = (AmqpJmsMessageFacade) jmsMessage.getFacade();
                 
-                LOGGER.debug("Consumer #{} - Extracting AMQP properties into MessageAttributes", workerId);
-                
-                // AMQP Standard Properties
                 if (facade.getContentType() != null) {
-                    String contentTypeStr = facade.getContentType().toString();
-                    attributes.setContentType(contentTypeStr);
-                    LOGGER.debug("Consumer #{} - Set contentType: {}", workerId, contentTypeStr);
+                    attributes.setContentType(facade.getContentType().toString());
                 }
                 
                 if (facade.getUserId() != null) {
-                    String userIdStr = facade.getUserId().toString();
-                    attributes.setUserId(userIdStr);
-                    LOGGER.debug("Consumer #{} - Set userId: {}", workerId, userIdStr);
+                    attributes.setUserId(facade.getUserId().toString());
                 }
                 
                 if (facade.getGroupId() != null) {
                     attributes.setGroupId(facade.getGroupId());
-                    LOGGER.debug("Consumer #{} - Set groupId: {}", workerId, facade.getGroupId());
                 }
                 
                 attributes.setGroupSequence(facade.getGroupSequence());
-                LOGGER.debug("Consumer #{} - Set groupSequence: {}", workerId, facade.getGroupSequence());
                 
                 if (facade.getReplyToGroupId() != null) {
                     attributes.setReplyToGroupId(facade.getReplyToGroupId());
-                    LOGGER.debug("Consumer #{} - Set replyToGroupId: {}", workerId, facade.getReplyToGroupId());
                 }
                 
-                // Extract AMQP Application Properties into custom properties
+                // Extract custom properties
                 Map<String, Object> customProperties = new HashMap<>();
                 Set<String> propertyNames = new HashSet<>();
                 facade.getApplicationPropertyNames(propertyNames);
                 
-                if (!propertyNames.isEmpty()) {
-                    LOGGER.debug("Consumer #{} - Extracting {} AMQP application properties", 
-                        workerId, propertyNames.size());
-                    for (String name : propertyNames) {
-                        Object value = facade.getApplicationProperty(name);
-                        customProperties.put(name, value);
-                        LOGGER.debug("Consumer #{} - Added AMQP application property: {} = {}", 
-                            workerId, name, value);
-                    }
+                for (String name : propertyNames) {
+                    Object value = facade.getApplicationProperty(name);
+                    customProperties.put(name, value);
                 }
                 
-                // Also add standard JMS custom properties (non-internal)
+                // Add JMS properties
                 java.util.Enumeration<?> jmsPropertyNames = message.getPropertyNames();
                 while (jmsPropertyNames.hasMoreElements()) {
                     String propertyName = (String) jmsPropertyNames.nextElement();
                     
-                    // Skip internal properties that are already handled
                     if (JMS_AMQP_CONTENT_TYPE.equals(propertyName) ||
                         "JMSXContentType".equals(propertyName)) {
                         continue;
                     }
                     
-                    // Only add if not already present from AMQP application properties
                     if (!customProperties.containsKey(propertyName)) {
                         Object propertyValue = message.getObjectProperty(propertyName);
                         customProperties.put(propertyName, propertyValue);
-                        LOGGER.debug("Consumer #{} - Added JMS property: {} = {}", 
-                            workerId, propertyName, propertyValue);
                     }
                 }
                 
-                attributes.setCustomProperties(customProperties);
-                LOGGER.debug("Consumer #{} - Extracted {} total custom properties", 
-                    workerId, customProperties.size());
-                
-            } catch (ClassCastException e) {
-                LOGGER.warn("Consumer #{} - Message facade is not AmqpJmsMessageFacade, falling back to standard JMS properties: {}", 
-                    workerId, e.getMessage());
-                
-                // Fallback: Extract standard JMS properties only
-                Map<String, Object> customProperties = new HashMap<>();
-                java.util.Enumeration<?> propertyNames = message.getPropertyNames();
-                while (propertyNames.hasMoreElements()) {
-                    String propertyName = (String) propertyNames.nextElement();
-                    
-                    if (JMS_AMQP_CONTENT_TYPE.equals(propertyName) ||
-                        "JMSXContentType".equals(propertyName)) {
-                        continue;
-                    }
-                    
-                    Object propertyValue = message.getObjectProperty(propertyName);
-                    customProperties.put(propertyName, propertyValue);
-                }
                 attributes.setCustomProperties(customProperties);
                 
             } catch (Exception e) {
-                LOGGER.error("Consumer #{} - Error extracting AMQP properties: {}", 
-                    workerId, e.getMessage(), e);
-                
                 // Fallback to standard JMS properties
                 Map<String, Object> customProperties = new HashMap<>();
                 java.util.Enumeration<?> propertyNames = message.getPropertyNames();
@@ -865,22 +699,19 @@ public class SapAmqpConnectorMessageSource extends Source<Object, MessageAttribu
     }
 
     /**
-     * Get JMS acknowledgment mode from enum parameter
+     * Get JMS acknowledgment mode
      */
     private int getAcknowledgmentMode() {
         if (ackMode == null || ackMode == AcknowledgmentMode.AUTO) {
-            LOGGER.info("Using AUTO_ACKNOWLEDGE mode");
+            LOGGER.debug("Using AUTO_ACKNOWLEDGE mode");
             return Session.AUTO_ACKNOWLEDGE;
         }
         
         if (ackMode == AcknowledgmentMode.CLIENT) {
-            LOGGER.info("Using INDIVIDUAL_ACKNOWLEDGE mode (Qpid JMS) - each message acknowledged independently");
-            LOGGER.debug("INDIVIDUAL_ACKNOWLEDGE constant value: {}", INDIVIDUAL_ACKNOWLEDGE);
-            return INDIVIDUAL_ACKNOWLEDGE;  // Value: 101 (Qpid-specific mode)
+            LOGGER.debug("Using CLIENT_ACKNOWLEDGE mode");
+            return INDIVIDUAL_ACKNOWLEDGE;
         }
         
-        // Default to AUTO
-        LOGGER.info("Using AUTO_ACKNOWLEDGE mode (default)");
         return Session.AUTO_ACKNOWLEDGE;
     }
 
@@ -914,10 +745,8 @@ public class SapAmqpConnectorMessageSource extends Source<Object, MessageAttribu
                 throw new ConnectionException("Unsupported protocol: " + protocol);
             }
             
-            // URL encode the Bearer token
             String encodedToken = URLEncoder.encode("Bearer " + accessToken, "UTF-8");
             
-            // Build connection URL with Authorization header
             return String.format(
                 "%s://%s:%d%s?transport.tcpNoDelay=true&transport.ws.httpHeader.Authorization=%s",
                 amqpProtocol, host, targetPort, path, encodedToken
@@ -930,26 +759,23 @@ public class SapAmqpConnectorMessageSource extends Source<Object, MessageAttribu
     }
 
     /**
-     * Fetch OAuth2 access token from SAP Event Mesh
+     * Fetch OAuth2 access token
      */
     private String fetchNewAccessToken() throws ConnectionException {
-        LOGGER.info("Fetching OAuth2 token for message consumption...");
+        LOGGER.info("Fetching OAuth2 token...");
         CloseableHttpClient httpClient = HttpClients.createDefault();
         HttpPost httpPost = new HttpPost(tokenUrl);
 
         try {
-            // Set Basic Authentication header
             String auth = clientId + ":" + clientSecret;
             String encodedAuth = Base64.getEncoder().encodeToString(auth.getBytes());
             httpPost.setHeader("Authorization", "Basic " + encodedAuth);
             httpPost.setHeader("Content-Type", "application/x-www-form-urlencoded");
 
-            // Set grant_type parameter
             List<NameValuePair> params = new ArrayList<>();
             params.add(new BasicNameValuePair("grant_type", "client_credentials"));
             httpPost.setEntity(new UrlEncodedFormEntity(params));
 
-            LOGGER.debug("Token request to: {}", tokenUrl);
             HttpResponse response = httpClient.execute(httpPost);
             HttpEntity entity = response.getEntity();
             int statusCode = response.getStatusLine().getStatusCode();
@@ -960,7 +786,7 @@ public class SapAmqpConnectorMessageSource extends Source<Object, MessageAttribu
                 
                 if (jsonNode.has("access_token")) {
                     String token = jsonNode.get("access_token").asText();
-                    LOGGER.info("Successfully fetched OAuth2 token for consumption");
+                    LOGGER.info("Successfully fetched OAuth2 token");
                     return token;
                 } else {
                     throw new ConnectionException("Access token not found in response");
