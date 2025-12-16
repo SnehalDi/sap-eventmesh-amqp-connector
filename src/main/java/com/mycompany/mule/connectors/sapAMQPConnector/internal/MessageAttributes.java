@@ -2,9 +2,6 @@ package com.mycompany.mule.connectors.sapAMQPConnector.internal;
 
 import java.util.Map;
 
-/**
- * Message attributes including JMS headers, AMQP properties, and retry metadata
- */
 public class MessageAttributes {
     
     // Standard JMS headers
@@ -19,31 +16,25 @@ public class MessageAttributes {
     private long expiration;
     private int priority;
     
-    // AMQP properties
+    // AMQP Standard Properties
     private String contentType;
     private String userId;
     private String groupId;
     private long groupSequence;
     private String replyToGroupId;
     
-	  // Additional metadata
+    // Additional metadata
     private String messageType;
     private String mimeType;
     private String status;
     private String statusMessage;
     private String errorMessage;
     private Long timeout;
-	
-    // Custom properties (AMQP application properties + JMS custom properties)
+    
+    // Custom properties (includes AMQP Application Properties)
     private Map<String, Object> customProperties;
     
-    // Acknowledgment properties (for CLIENT mode)
-    private String ackId;
-    private boolean requiresAcknowledgment;
-    
-
-    
-    // Getters and Setters - Standard JMS Headers
+    // Getters and Setters
     
     public String getMessageId() {
         return messageId;
@@ -125,7 +116,7 @@ public class MessageAttributes {
         this.priority = priority;
     }
     
-    // Getters and Setters - AMQP Properties
+    // AMQP Standard Properties
     
     public String getContentType() {
         return contentType;
@@ -166,8 +157,8 @@ public class MessageAttributes {
     public void setReplyToGroupId(String replyToGroupId) {
         this.replyToGroupId = replyToGroupId;
     }
-	   
- // Additional metadata
+    
+    // Additional metadata
     
     public String getMessageType() {
         return messageType;
@@ -217,7 +208,7 @@ public class MessageAttributes {
         this.timeout = timeout;
     }
     
-    // Getters and Setters - Custom Properties
+    // Custom Properties (includes AMQP Application Properties)
     
     public Map<String, Object> getCustomProperties() {
         return customProperties;
@@ -225,37 +216,5 @@ public class MessageAttributes {
     
     public void setCustomProperties(Map<String, Object> customProperties) {
         this.customProperties = customProperties;
-    }
-    
-    // Getters and Setters - Acknowledgment Properties
-    
-    public String getackId() {
-        return ackId;
-    }
-    
-    public void setackId(String ackId) {
-        this.ackId = ackId;
-    }
-    
-    public boolean isRequiresAcknowledgment() {
-        return requiresAcknowledgment;
-    }
-    
-    public void setRequiresAcknowledgment(boolean requiresAcknowledgment) {
-        this.requiresAcknowledgment = requiresAcknowledgment;
-    }
-  
- 
-    
-    @Override
-    public String toString() {
-        return "MessageAttributes{" +
-                "messageId='" + messageId + '\'' +
-                ", timestamp=" + timestamp +
-                ", correlationId='" + correlationId + '\'' +
-                ", destination='" + destination + '\'' +
-                ", contentType='" + contentType + '\'' +
-                ", requiresAcknowledgment=" + requiresAcknowledgment +
-                '}';
     }
 }

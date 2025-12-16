@@ -1,3 +1,4 @@
+
 package com.mycompany.mule.connectors.sapAMQPConnector.internal;
 
 import static org.mule.runtime.extension.api.annotation.param.MediaType.ANY;
@@ -26,13 +27,11 @@ import org.slf4j.LoggerFactory;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.util.List;
-import java.util.ArrayList;
 import java.util.Enumeration;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
 import java.net.URI;
 import java.net.URLEncoder;
 import java.io.InputStream;
@@ -44,9 +43,6 @@ public class SapAmqpConnectorOperations {
     
     // JMS property key for AMQP content-type
     private static final String JMS_AMQP_CONTENT_TYPE = "JMS_AMQP_CONTENT_TYPE";
-    
-    // Qpid JMS INDIVIDUAL_ACKNOWLEDGE mode constant
-    private static final int INDIVIDUAL_ACKNOWLEDGE = 101;
 
     @DisplayName("Publish")
     @MediaType(value = ANY, strict = false)
@@ -95,7 +91,7 @@ public class SapAmqpConnectorOperations {
             BytesMessage msg = session.createBytesMessage();
             msg.writeBytes(messageBytes);
             
-            // Set AMQP content-type property
+            // Set AMQP content-type property (standard AMQP 1.0 property via Qpid JMS)
             msg.setStringProperty(JMS_AMQP_CONTENT_TYPE, mimeType);
             LOGGER.debug("Set AMQP content-type property: {}", mimeType);
             
@@ -119,14 +115,6 @@ public class SapAmqpConnectorOperations {
         }
     }
 
-    /**
-     * Enumeration for Consume acknowledgment modes
-     */
-    enum ConsumeAckMode {
-        AUTO,
-        CLIENT
-    }
-
     @DisplayName("Consume")
     @MediaType(value = ANY, strict = false)
     @Summary("Synchronously consume a single message from SAP Event Mesh queue")
@@ -137,20 +125,15 @@ public class SapAmqpConnectorOperations {
             @DisplayName("Queue Name") @Summary("Name of the queue to consume from") String queueName,
             @Optional(defaultValue = "5000") @DisplayName("Timeout (ms)") 
             @Summary("Time to wait for a message in milliseconds (default: 5000ms)") long timeout,
-            @Optional(defaultValue = "AUTO") @DisplayName("Acknowledgment Mode")
-            @Summary("AUTO: message auto-acknowledged (default), CLIENT: manual acknowledgment required")
-            ConsumeAckMode ackMode,
             @Optional @DisplayName("Headers") @Summary("Custom headers including Authorization token") 
             @NullSafe List<MessageHeader> headers) {
 
         jakarta.jms.Connection jmsConnection = null;
         Session session = null;
         MessageConsumer consumer = null;
-        boolean isClientMode = (ackMode == ConsumeAckMode.CLIENT);
 
         try {
             LOGGER.info("=== Starting SAP Event Mesh Message Consumption ===");
-            LOGGER.info("Acknowledgment Mode: {}", ackMode);
 
             // Extract and validate access token
             String accessToken = extractAccessToken(headers);
@@ -161,12 +144,11 @@ public class SapAmqpConnectorOperations {
             // Create and start JMS connection
             jmsConnection = createJmsConnection(config, accessToken, connection);
 
-            // Create session with appropriate acknowledgment mode
-            int sessionAckMode = isClientMode ? INDIVIDUAL_ACKNOWLEDGE : Session.AUTO_ACKNOWLEDGE;
-            session = jmsConnection.createSession(false, sessionAckMode);
+            // Create session and consumer
+            session = jmsConnection.createSession(false, Session.AUTO_ACKNOWLEDGE);
             Destination queue = session.createQueue(queueName);
             consumer = session.createConsumer(queue);
-            LOGGER.debug("Message Consumer created for queue: {} with {} mode", queueName, ackMode);
+            LOGGER.debug("Message Consumer created for queue: {}", queueName);
 
             // Receive message with timeout
             LOGGER.info("Waiting for message (timeout: {}ms)...", timeout);
@@ -182,23 +164,7 @@ public class SapAmqpConnectorOperations {
             byte[] payloadBytes = extractPayloadAsBytes(message);
             MessageAttributes attributes = extractMessageAttributes(message);
             
-            // Handle CLIENT mode - register for acknowledgment
-            if (isClientMode) {
-                // CRITICAL: Keep session open for acknowledgment (connection is shared and managed separately)
-                String acknowledgmentId = AcknowledgmentRegistry.getInstance()
-                    .registerMessage(message, session);
-                attributes.setackId(acknowledgmentId);
-                attributes.setRequiresAcknowledgment(true);
-                
-                LOGGER.debug("CLIENT mode: Message registered for acknowledgment with ID: {}", acknowledgmentId);
-                LOGGER.warn("Message must be explicitly acknowledged using 'Acknowledge Message' operation");
-                LOGGER.warn("Session will remain open until acknowledgment or timeout");
-            } else {
-                attributes.setRequiresAcknowledgment(false);
-                LOGGER.info("AUTO mode: Message automatically acknowledged");
-            }
-            
-            // Get content-type from attributes
+            // Get content-type from attributes (extracted from AMQP properties)
             String contentType = attributes.getContentType();
             org.mule.runtime.api.metadata.MediaType outputMediaType;
             
@@ -207,7 +173,7 @@ public class SapAmqpConnectorOperations {
                     outputMediaType = org.mule.runtime.api.metadata.MediaType.parse(contentType);
                     LOGGER.info("Using AMQP content-type: {}", contentType);
                 } catch (Exception e) {
-                    LOGGER.warn("Invalid content-type '{}', defaulting to ANY", contentType);
+                    LOGGER.warn("Invalid content-type '{}', defaulting to ANY: {}", contentType, e.getMessage());
                     outputMediaType = org.mule.runtime.api.metadata.MediaType.ANY;
                 }
             } else {
@@ -218,7 +184,7 @@ public class SapAmqpConnectorOperations {
             LOGGER.info("Message ID: {}, Content-Type: {}, Size: {} bytes", 
                 attributes.getMessageId(), contentType, payloadBytes.length);
             
-            // Parse payload based on content type
+            // Parse payload based on content type from AMQP properties
             Object outputPayload = parsePayload(payloadBytes, outputMediaType);
             
             return Result.<Object, MessageAttributes>builder()
@@ -233,122 +199,7 @@ public class SapAmqpConnectorOperations {
             LOGGER.error("Unexpected error", e);
             return buildErrorResult("ERROR", "Unexpected error: " + e.getMessage());
         } finally {
-            // Close consumer always
-            if (consumer != null) {
-                try {
-                    consumer.close();
-                    LOGGER.debug("Consumer closed");
-                } catch (Exception e) {
-                    LOGGER.error("Error closing consumer", e);
-                }
-            }
-            
-            // In CLIENT mode: DO NOT close session and connection - they're needed for acknowledgment
-            // They will be closed when message is acknowledged or cleaned up by timeout
-            if (isClientMode) {
-                LOGGER.debug("CLIENT mode: Session and connection kept open for acknowledgment");
-                // Session and connection ownership transferred to AcknowledgmentRegistry
-            } else {
-                // In AUTO mode: close everything immediately
-                if (session != null) {
-                    try {
-                        session.close();
-                        LOGGER.debug("Session closed (AUTO mode)");
-                    } catch (Exception e) {
-                        LOGGER.error("Error closing session", e);
-                    }
-                }
-                
-                try {
-                    connection.disconnect();
-                    LOGGER.debug("Connection closed (AUTO mode)");
-                } catch (Exception e) {
-                    LOGGER.error("Error closing connection", e);
-                }
-            }
-        }
-    }
-
-    // ========================================================================
-    // ACKNOWLEDGMENT OPERATION
-    // ========================================================================
-    
-    /**
-     * Acknowledge a message
-     * If not called, message remains unacknowledged and will be redelivered by broker
-     */
-    @DisplayName("Acknowledge Message")
-    @Summary("Acknowledges a message - if not called, message will be redelivered by broker")
-    @MediaType(value = ANY, strict = false)
-    public void acknowledgeMessage(
-            @DisplayName("Acknowledgment ID")
-            @Summary("The acknowledgment ID from the message attributes")
-            String acknowledgmentId,
-            
-            @Connection
-            SapAmqpConnectorConnection connection) {
-        
-        LOGGER.info("=== Acknowledging Message ===");
-        LOGGER.debug("Acknowledgment ID: {}", acknowledgmentId);
-        
-        if (acknowledgmentId == null || acknowledgmentId.trim().isEmpty()) {
-            String errorMsg = "Acknowledgment ID is required";
-            LOGGER.error(errorMsg);
-            throw new RuntimeException(errorMsg);
-        }
-        
-        // Retrieve pending acknowledgment from registry
-        AcknowledgmentRegistry registry = AcknowledgmentRegistry.getInstance();
-        AcknowledgmentRegistry.PendingAcknowledgment pending = registry.getPendingAcknowledgment(acknowledgmentId);
-        
-        if (pending == null) {
-            String errorMsg = "No pending acknowledgment found for ID: " + acknowledgmentId + 
-                             ". It may have already been acknowledged or timed out.";
-            LOGGER.error(errorMsg);
-            throw new RuntimeException(errorMsg);
-        }
-        
-        try {
-            Message message = pending.getMessage();
-            Session session = pending.getSession();
-            
-            LOGGER.debug("Pending acknowledgment age: {} seconds", pending.getAgeInSeconds());
-            LOGGER.debug("Message ID: {}", message.getJMSMessageID());
-            
-            // Validate session is still open
-            try {
-                // Test if session is still active
-                session.getAcknowledgeMode();
-            } catch (Exception e) {
-                String errorMsg = "Session is no longer valid: " + e.getMessage();
-                LOGGER.error(errorMsg);
-                registry.removePendingAcknowledgment(acknowledgmentId);
-                throw new RuntimeException(errorMsg, e);
-            }
-            
-            // Acknowledge the message
-            message.acknowledge();
-            LOGGER.info("Message acknowledged successfully");
-            
-            // Clean up session (NOT connection - it's shared)
-            try {
-                if (session != null) {
-                    session.close();
-                    LOGGER.debug("Session closed after acknowledgment");
-                }
-            } catch (Exception e) {
-                LOGGER.warn("Error closing session: {}", e.getMessage());
-            }
-            
-            // Remove from registry
-            registry.removePendingAcknowledgment(acknowledgmentId);
-            
-        } catch (JMSException e) {
-            String errorMsg = "Failed to acknowledge message: " + e.getMessage();
-            LOGGER.error(errorMsg, e);
-            // Remove from registry even on error to prevent memory leak
-            registry.removePendingAcknowledgment(acknowledgmentId);
-            throw new RuntimeException(errorMsg, e);
+            closeResources(consumer, session, connection);
         }
     }
 
@@ -397,6 +248,7 @@ public class SapAmqpConnectorOperations {
             String path = uri.getPath();
             int port = uri.getPort();
             
+            // Determine protocol and port
             String amqpProtocol;
             int targetPort;
             
@@ -428,6 +280,7 @@ public class SapAmqpConnectorOperations {
         
         int headerCount = 0;
         for (MessageHeader header : headers) {
+            // Skip authorization header
             if ("Authorization".equalsIgnoreCase(header.getKey())) {
                 continue;
             }
@@ -454,9 +307,16 @@ public class SapAmqpConnectorOperations {
     private byte[] extractPayloadAsBytes(Message message) throws Exception {
         LOGGER.debug("Message type: {}", message.getClass().getName());
         
+        // Log AMQP properties
+        logAmqpProperties(message);
+        
+        // Extract payload based on JMS message type
         if (message instanceof BytesMessage) {
             BytesMessage bytesMessage = (BytesMessage) message;
             long bodyLength = bytesMessage.getBodyLength();
+            
+            LOGGER.debug("=== BytesMessage Detected ===");
+            LOGGER.debug("Body length: {} bytes", bodyLength);
             
             if (bodyLength > Integer.MAX_VALUE) {
                 throw new RuntimeException("Message too large: " + bodyLength + " bytes");
@@ -477,11 +337,19 @@ public class SapAmqpConnectorOperations {
             TextMessage textMessage = (TextMessage) message;
             String text = textMessage.getText();
             
+            LOGGER.debug("=== TextMessage Detected ===");
+            
             if (text == null) {
                 LOGGER.warn("TextMessage has null content");
                 return new byte[0];
             }
             
+            // Log preview of text content
+            String preview = text.length() > 100 ? text.substring(0, 100) + "..." : text;
+            LOGGER.debug("Text content preview: {}", preview);
+            LOGGER.debug("Text content length: {} characters", text.length());
+            
+            // Convert text to bytes using UTF-8
             byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
             LOGGER.debug("Extracted {} bytes from TextMessage", bytes.length);
             
@@ -491,11 +359,14 @@ public class SapAmqpConnectorOperations {
             ObjectMessage objMessage = (ObjectMessage) message;
             Object obj = objMessage.getObject();
             
+            LOGGER.debug("ObjectMessage detected");
+            
             if (obj == null) {
                 LOGGER.warn("ObjectMessage has null content");
                 return new byte[0];
             }
             
+            // Handle different object types
             if (obj instanceof byte[]) {
                 byte[] bytes = (byte[]) obj;
                 LOGGER.debug("ObjectMessage contains byte array of {} bytes", bytes.length);
@@ -503,15 +374,23 @@ public class SapAmqpConnectorOperations {
             } else if (obj instanceof String) {
                 String text = (String) obj;
                 byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
-                LOGGER.debug("ObjectMessage contains String of {} bytes", bytes.length);
+                LOGGER.debug("ObjectMessage contains String of {} characters ({} bytes)", 
+                    text.length(), bytes.length);
                 return bytes;
             } else {
+                // Serialize to JSON
+                LOGGER.debug("ObjectMessage contains {} object, serializing to JSON", 
+                    obj.getClass().getSimpleName());
                 String json = objectMapper.writeValueAsString(obj);
                 return json.getBytes(StandardCharsets.UTF_8);
             }
             
         } else if (message instanceof MapMessage) {
             MapMessage mapMessage = (MapMessage) message;
+            
+            LOGGER.debug("MapMessage detected, converting to JSON");
+            
+            // Convert MapMessage to JSON
             Map<String, Object> map = new HashMap<>();
             Enumeration<?> mapNames = mapMessage.getMapNames();
             
@@ -522,19 +401,77 @@ public class SapAmqpConnectorOperations {
             
             String json = objectMapper.writeValueAsString(map);
             byte[] bytes = json.getBytes(StandardCharsets.UTF_8);
-            LOGGER.debug("Extracted {} bytes from MapMessage", bytes.length);
+            LOGGER.debug("Extracted {} bytes from MapMessage (converted to JSON)", bytes.length);
             
             return bytes;
             
         } else if (message instanceof StreamMessage) {
-            LOGGER.warn("StreamMessage detected - not fully supported");
+            LOGGER.warn("StreamMessage detected - not fully supported, converting to string");
             String text = message.toString();
             return text.getBytes(StandardCharsets.UTF_8);
             
         } else {
-            LOGGER.warn("Unknown message type: {}", message.getClass().getName());
+            LOGGER.warn("Unknown message type: {}, using toString()", message.getClass().getName());
             String text = message.toString();
             return text.getBytes(StandardCharsets.UTF_8);
+        }
+    }
+
+    /**
+     * Logs AMQP properties from the message facade for debugging purposes.
+     */
+    private void logAmqpProperties(Message message) {
+        try {
+            JmsMessage jmsMessage = (JmsMessage) message;
+            AmqpJmsMessageFacade facade = (AmqpJmsMessageFacade) jmsMessage.getFacade();
+            
+            LOGGER.debug("==========================================");
+            LOGGER.debug("AMQP MESSAGE PROPERTIES");
+            LOGGER.debug("==========================================");
+            
+            // Log AMQP standard properties
+            LOGGER.debug("--- AMQP Standard Properties ---");
+            logProperty("Content-Type", facade.getContentType());
+            logProperty("Message-ID", facade.getMessageId());
+            logProperty("Correlation-ID", facade.getCorrelationId());
+            logProperty("User-ID", facade.getUserId());
+            logProperty("Group-ID", facade.getGroupId());
+            logProperty("Group-Sequence", facade.getGroupSequence());
+            logProperty("Reply-To-Group-ID", facade.getReplyToGroupId());
+            
+            // Log all application properties
+            LOGGER.debug("--- Application Properties ---");
+            Set<String> propertyNames = new HashSet<>();
+            facade.getApplicationPropertyNames(propertyNames);
+            
+            if (propertyNames.isEmpty()) {
+                LOGGER.debug("No application properties found");
+            } else {
+                LOGGER.debug("Found {} application properties:", propertyNames.size());
+                for (String name : propertyNames) {
+                    Object value = facade.getApplicationProperty(name);
+                    String valueType = value != null ? value.getClass().getSimpleName() : "null";
+                    LOGGER.debug("  {} = {} ({})", name, value, valueType);
+                }
+            }
+            
+            LOGGER.debug("==========================================");
+            
+        } catch (ClassCastException e) {
+            LOGGER.warn("Message facade is not AmqpJmsMessageFacade: {}", e.getMessage());
+        } catch (Exception e) {
+            LOGGER.warn("Error accessing AMQP message properties: {}", e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Helper method to log a property with null-safe handling
+     */
+    private void logProperty(String name, Object value) {
+        if (value != null) {
+            LOGGER.debug("{}: {}", name, value);
+        } else {
+            LOGGER.debug("{}: <not set>", name);
         }
     }
 
@@ -543,11 +480,12 @@ public class SapAmqpConnectorOperations {
             String mimeType = mediaType.toRfcString().toLowerCase();
             LOGGER.debug("Parsing payload with MIME type: {}", mimeType);
             
-            // Handle JSON content types
+            // Handle JSON content types - return as String for Mule compatibility
             if (mimeType.contains("application/json") || mimeType.contains("+json")) {
                 String jsonString = new String(payloadBytes, StandardCharsets.UTF_8);
                 LOGGER.debug("Returning JSON payload as String (size: {} bytes)", payloadBytes.length);
-                return jsonString;
+                LOGGER.info("Successfully prepared JSON payload");
+                return jsonString;  // Return as String, not parsed object
             }
             
             // Handle XML content types
@@ -599,11 +537,13 @@ public class SapAmqpConnectorOperations {
             }
             
             // For binary or unknown types, return as InputStream
-            LOGGER.debug("Returning payload as InputStream (size: {} bytes)", payloadBytes.length);
+            LOGGER.debug("Returning payload as InputStream for binary/unknown content-type: {} (size: {} bytes)", 
+                mimeType, payloadBytes.length);
             return new java.io.ByteArrayInputStream(payloadBytes);
             
         } catch (Exception e) {
-            LOGGER.warn("Failed to parse payload, returning as InputStream: {}", e.getMessage());
+            LOGGER.warn("Failed to parse payload ({}), returning as InputStream: {}", 
+                mediaType.toRfcString(), e.getMessage());
             return new java.io.ByteArrayInputStream(payloadBytes);
         }
     }
@@ -623,12 +563,12 @@ public class SapAmqpConnectorOperations {
         attributes.setExpiration(message.getJMSExpiration());
         attributes.setPriority(message.getJMSPriority());
         
-        // Extract AMQP properties
+        // Extract AMQP properties and add to attributes
         try {
             JmsMessage jmsMessage = (JmsMessage) message;
             AmqpJmsMessageFacade facade = (AmqpJmsMessageFacade) jmsMessage.getFacade();
             
-            LOGGER.debug("Extracting AMQP properties");
+            LOGGER.debug("Extracting AMQP properties into MessageAttributes");
             
             // AMQP Standard Properties
             if (facade.getContentType() != null) {
@@ -649,44 +589,70 @@ public class SapAmqpConnectorOperations {
             }
             
             attributes.setGroupSequence(facade.getGroupSequence());
+            LOGGER.debug("Set groupSequence: {}", facade.getGroupSequence());
             
             if (facade.getReplyToGroupId() != null) {
                 attributes.setReplyToGroupId(facade.getReplyToGroupId());
+                LOGGER.debug("Set replyToGroupId: {}", facade.getReplyToGroupId());
             }
             
-            // Extract AMQP Application Properties
+            // Extract AMQP Application Properties into custom properties
             Map<String, Object> customProperties = new HashMap<>();
             Set<String> propertyNames = new HashSet<>();
             facade.getApplicationPropertyNames(propertyNames);
             
             if (!propertyNames.isEmpty()) {
+                LOGGER.debug("Extracting {} AMQP application properties", propertyNames.size());
                 for (String name : propertyNames) {
                     Object value = facade.getApplicationProperty(name);
                     customProperties.put(name, value);
+                    LOGGER.debug("Added AMQP application property: {} = {}", name, value);
                 }
             }
             
-            // Also add standard JMS custom properties
+            // Also add standard JMS custom properties (non-internal)
             java.util.Enumeration<?> jmsPropertyNames = message.getPropertyNames();
             while (jmsPropertyNames.hasMoreElements()) {
                 String propertyName = (String) jmsPropertyNames.nextElement();
                 
-                // Skip internal properties
+                // Skip internal properties that are already handled
                 if (JMS_AMQP_CONTENT_TYPE.equals(propertyName) ||
                     "JMSXContentType".equals(propertyName)) {
                     continue;
                 }
                 
+                // Only add if not already present from AMQP application properties
                 if (!customProperties.containsKey(propertyName)) {
                     Object propertyValue = message.getObjectProperty(propertyName);
                     customProperties.put(propertyName, propertyValue);
+                    LOGGER.debug("Added JMS property: {} = {}", propertyName, propertyValue);
                 }
             }
             
             attributes.setCustomProperties(customProperties);
+            LOGGER.debug("Extracted {} total custom properties", customProperties.size());
+            
+        } catch (ClassCastException e) {
+            LOGGER.warn("Message facade is not AmqpJmsMessageFacade, falling back to standard JMS properties: {}", e.getMessage());
+            
+            // Fallback: Extract standard JMS properties only
+            Map<String, Object> customProperties = new HashMap<>();
+            java.util.Enumeration<?> propertyNames = message.getPropertyNames();
+            while (propertyNames.hasMoreElements()) {
+                String propertyName = (String) propertyNames.nextElement();
+                
+                if (JMS_AMQP_CONTENT_TYPE.equals(propertyName) ||
+                    "JMSXContentType".equals(propertyName)) {
+                    continue;
+                }
+                
+                Object propertyValue = message.getObjectProperty(propertyName);
+                customProperties.put(propertyName, propertyValue);
+            }
+            attributes.setCustomProperties(customProperties);
             
         } catch (Exception e) {
-            LOGGER.debug("Using standard JMS properties only");
+            LOGGER.error("Error extracting AMQP properties: {}", e.getMessage(), e);
             
             // Fallback to standard JMS properties
             Map<String, Object> customProperties = new HashMap<>();
@@ -714,6 +680,7 @@ public class SapAmqpConnectorOperations {
         }
         
         if (payload instanceof String) {
+            // String content - preserve as-is without any transformation
             return ((String) payload).getBytes(StandardCharsets.UTF_8);
         }
         
@@ -727,11 +694,12 @@ public class SapAmqpConnectorOperations {
             }
         }
         
+        // For other objects, try to serialize to JSON
         try {
             String jsonString = objectMapper.writeValueAsString(payload);
             return jsonString.getBytes(StandardCharsets.UTF_8);
         } catch (Exception e) {
-            LOGGER.warn("Failed to serialize payload to JSON: {}", e.getMessage());
+            LOGGER.warn("Failed to serialize payload to JSON, using toString(): {}", e.getMessage());
             return payload.toString().getBytes(StandardCharsets.UTF_8);
         }
     }
@@ -748,32 +716,51 @@ public class SapAmqpConnectorOperations {
     }
 
     private Result<Object, MessageAttributes> buildNoMessageResult(long timeout) {
-        MessageAttributes attributes = new MessageAttributes();
-        attributes.setStatus("NO_MESSAGE");
-        attributes.setStatusMessage("No message available in queue");
-        attributes.setTimeout(timeout);
-        
-        InputStream emptyStream = new java.io.ByteArrayInputStream(new byte[0]);
-        
-        return Result.<Object, MessageAttributes>builder()
-                .output(emptyStream)
-                .attributes(attributes)
-                .mediaType(org.mule.runtime.api.metadata.MediaType.ANY)
-                .build();
+        try {
+            MessageAttributes attributes = new MessageAttributes();
+            attributes.setStatus("NO_MESSAGE");
+            attributes.setStatusMessage("No message available in queue within timeout period");
+            attributes.setTimeout(timeout);
+            
+            InputStream emptyStream = new java.io.ByteArrayInputStream(new byte[0]);
+            
+            return Result.<Object, MessageAttributes>builder()
+                    .output(emptyStream)
+                    .attributes(attributes)
+                    .mediaType(org.mule.runtime.api.metadata.MediaType.ANY)
+                    .build();
+        } catch (Exception e) {
+            LOGGER.error("Error building no message result", e);
+            return buildErrorResult("ERROR", "Error building response: " + e.getMessage());
+        }
     }
 
     private Result<Object, MessageAttributes> buildErrorResult(String status, String errorMessage) {
-        MessageAttributes attributes = new MessageAttributes();
-        attributes.setStatus(status);
-        attributes.setErrorMessage(errorMessage);
-        
-        InputStream emptyStream = new java.io.ByteArrayInputStream(new byte[0]);
-        
-        return Result.<Object, MessageAttributes>builder()
-                .output(emptyStream)
-                .attributes(attributes)
-                .mediaType(org.mule.runtime.api.metadata.MediaType.ANY)
-                .build();
+        try {
+            MessageAttributes attributes = new MessageAttributes();
+            attributes.setStatus(status);
+            attributes.setErrorMessage(errorMessage);
+            
+            InputStream emptyStream = new java.io.ByteArrayInputStream(new byte[0]);
+            
+            return Result.<Object, MessageAttributes>builder()
+                    .output(emptyStream)
+                    .attributes(attributes)
+                    .mediaType(org.mule.runtime.api.metadata.MediaType.ANY)
+                    .build();
+        } catch (Exception e) {
+            LOGGER.error("Error building error result", e);
+            // Fallback - return minimal result
+            MessageAttributes fallbackAttrs = new MessageAttributes();
+            fallbackAttrs.setStatus("ERROR");
+            fallbackAttrs.setErrorMessage("Critical error: " + e.getMessage());
+            InputStream emptyStream = new java.io.ByteArrayInputStream(new byte[0]);
+            return Result.<Object, MessageAttributes>builder()
+                    .output(emptyStream)
+                    .attributes(fallbackAttrs)
+                    .mediaType(org.mule.runtime.api.metadata.MediaType.ANY)
+                    .build();
+        }
     }
 
     private void handleJmsException(JMSException e, SapAmqpConnectorConnection connection) 
@@ -838,171 +825,6 @@ public class SapAmqpConnectorOperations {
             LOGGER.debug("JMS Connection closed"); 
         } catch (Exception e) { 
             LOGGER.error("Error closing connection", e); 
-        }
-    }
-    
-    // ========================================================================
-    // INNER CLASS: Acknowledgment Registry
-    // ========================================================================
-    
-    /**
-     * Registry for managing pending message acknowledgments
-     * CRITICAL: Only stores sessions (connections are shared and should NOT be closed per-message)
-     */
-    public static class AcknowledgmentRegistry {
-        
-        private static final Logger LOGGER = LoggerFactory.getLogger(AcknowledgmentRegistry.class);
-        
-        private static final AcknowledgmentRegistry INSTANCE = new AcknowledgmentRegistry();
-        
-        // Thread-safe map to store pending acknowledgments
-        private final Map<String, PendingAcknowledgment> pendingAcks = new ConcurrentHashMap<>();
-        
-        // Timeout for stale acknowledgments (5 minutes)
-        private static final long ACKNOWLEDGMENT_TIMEOUT_MS = 5 * 60 * 1000;
-        
-        private AcknowledgmentRegistry() {
-            // Start cleanup thread for stale acknowledgments
-            startCleanupThread();
-        }
-        
-        public static AcknowledgmentRegistry getInstance() {
-            return INSTANCE;
-        }
-        
-        /**
-         * Register message for acknowledgment
-         * NOTE: Only stores session (connection is shared across all messages)
-         */
-        public String registerMessage(Message message, Session session) {
-            String ackId = java.util.UUID.randomUUID().toString();
-            PendingAcknowledgment pending = new PendingAcknowledgment(message, session);
-            pendingAcks.put(ackId, pending);
-            
-            LOGGER.debug("Registered message for acknowledgment with ID: {}", ackId);
-            LOGGER.debug("Total pending acknowledgments: {}", pendingAcks.size());
-            
-            return ackId;
-        }
-        
-        public PendingAcknowledgment getPendingAcknowledgment(String ackId) {
-            PendingAcknowledgment pending = pendingAcks.get(ackId);
-            
-            if (pending != null && pending.isExpired()) {
-                LOGGER.warn("Acknowledgment {} has expired, removing", ackId);
-                removePendingAcknowledgment(ackId);
-                return null;
-            }
-            
-            return pending;
-        }
-        
-        public void removePendingAcknowledgment(String ackId) {
-            PendingAcknowledgment removed = pendingAcks.remove(ackId);
-            if (removed != null) {
-                LOGGER.debug("Removed pending acknowledgment with ID: {}", ackId);
-                LOGGER.debug("Remaining pending acknowledgments: {}", pendingAcks.size());
-            }
-        }
-        
-        public void clearAll() {
-            // Clean up all pending acknowledgments (only close sessions, not connections)
-            for (Map.Entry<String, PendingAcknowledgment> entry : pendingAcks.entrySet()) {
-                try {
-                    PendingAcknowledgment pending = entry.getValue();
-                    if (pending.getSession() != null) {
-                        pending.getSession().close();
-                        LOGGER.debug("Closed session for acknowledgment {}", entry.getKey());
-                    }
-                } catch (Exception e) {
-                    LOGGER.warn("Error cleaning up acknowledgment {}: {}", entry.getKey(), e.getMessage());
-                }
-            }
-            
-            int count = pendingAcks.size();
-            pendingAcks.clear();
-            LOGGER.debug("Cleared {} pending acknowledgments", count);
-        }
-        
-        /**
-         * Background thread to clean up stale acknowledgments
-         */
-        private void startCleanupThread() {
-            Thread cleanupThread = new Thread(() -> {
-                while (true) {
-                    try {
-                        Thread.sleep(60000); // Run every minute
-                        
-                        List<String> expiredIds = new ArrayList<>();
-                        
-                        for (Map.Entry<String, PendingAcknowledgment> entry : pendingAcks.entrySet()) {
-                            if (entry.getValue().isExpired()) {
-                                expiredIds.add(entry.getKey());
-                            }
-                        }
-                        
-                        for (String expiredId : expiredIds) {
-                            LOGGER.warn("Cleaning up expired acknowledgment: {}", expiredId);
-                            PendingAcknowledgment expired = pendingAcks.remove(expiredId);
-                            if (expired != null) {
-                                try {
-                                    if (expired.getSession() != null) {
-                                        expired.getSession().close();
-                                        LOGGER.debug("Closed expired session for ack {}", expiredId);
-                                    }
-                                } catch (Exception e) {
-                                    LOGGER.warn("Error closing resources for expired acknowledgment: {}", e.getMessage());
-                                }
-                            }
-                        }
-                        
-                        if (!expiredIds.isEmpty()) {
-                            LOGGER.info("Cleaned up {} expired acknowledgments", expiredIds.size());
-                        }
-                        
-                    } catch (InterruptedException e) {
-                        LOGGER.info("Cleanup thread interrupted");
-                        break;
-                    } catch (Exception e) {
-                        LOGGER.error("Error in cleanup thread", e);
-                    }
-                }
-            }, "AcknowledgmentRegistry-Cleanup");
-            
-            cleanupThread.setDaemon(true);
-            cleanupThread.start();
-            LOGGER.info("Started acknowledgment cleanup thread");
-        }
-        
-        /**
-         * Pending acknowledgment - only stores session (connection is shared)
-         */
-        public static class PendingAcknowledgment {
-            private final Message message;
-            private final Session session;
-            private final long registeredTime;
-            
-            public PendingAcknowledgment(Message message, Session session) {
-                this.message = message;
-                this.session = session;
-                this.registeredTime = System.currentTimeMillis();
-            }
-            
-            public Message getMessage() {
-                return message;
-            }
-            
-            public Session getSession() {
-                return session;
-            }
-            
-            public long getAgeInSeconds() {
-                return (System.currentTimeMillis() - registeredTime) / 1000;
-            }
-            
-            public boolean isExpired() {
-                return (System.currentTimeMillis() - registeredTime) > ACKNOWLEDGMENT_TIMEOUT_MS;
-            }
         }
     }
 }

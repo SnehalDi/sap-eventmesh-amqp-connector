@@ -5,8 +5,6 @@ import org.mule.runtime.extension.api.annotation.Configurations;
 import org.mule.runtime.extension.api.annotation.dsl.xml.Xml;
 // Removed JavaVersion imports
 import org.mule.sdk.api.annotation.JavaVersionSupport;
-
-
 import static org.mule.sdk.api.meta.JavaVersion.*;
 
 @Xml(prefix = "sap-amqp")
@@ -14,10 +12,6 @@ import static org.mule.sdk.api.meta.JavaVersion.*;
 @Configurations(SapAmqpConnectorConfiguration.class)
 @JavaVersionSupport({JAVA_17})
 
-
 public class SapAmqpConnectorExtension {
-    
-    // Extension class typically has no body
-    // All functionality is in Operations, Sources, and Configuration classes
-    
+
 }
