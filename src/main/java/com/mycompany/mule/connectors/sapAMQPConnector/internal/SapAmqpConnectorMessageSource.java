@@ -125,13 +125,13 @@ public class SapAmqpConnectorMessageSource extends Source<Object, MessageAttribu
     @Summary("AUTO: messages auto-acknowledged, CLIENT: manual acknowledgment required")
     private AcknowledgmentMode ackMode;
 
-    @Parameter
-    @Optional
-    @DisplayName("Message Selector")
-    @Summary("JMS message selector for filtering messages (optional)")
-    @Example("JMSPriority > 5")
-    @Expression(ExpressionSupport.SUPPORTED)
-    private String messageSelector;
+//    @Parameter
+//    @Optional
+//    @DisplayName("Message Selector")
+//    @Summary("JMS message selector for filtering messages (optional)")
+//    @Example("JMSPriority > 5")
+//    @Expression(ExpressionSupport.SUPPORTED)
+//    private String messageSelector;
 
     private jakarta.jms.Connection jmsConnection;
     private List<ConsumerWorker> consumers = new ArrayList<>();
@@ -188,8 +188,7 @@ public class SapAmqpConnectorMessageSource extends Source<Object, MessageAttribu
                     jmsConnection, 
                     queueName, 
                     sourceCallback, 
-                    sessionAckMode,
-                    messageSelector,
+                    sessionAckMode, //messageSelector,
                     i + 1
                 );
                 consumers.add(worker);
@@ -257,18 +256,18 @@ public class SapAmqpConnectorMessageSource extends Source<Object, MessageAttribu
         private final String queueName;
         private final SourceCallback<Object, MessageAttributes> callback;
         private final int sessionAckMode;
-        private final String selector;
+       // private final String selector;
         private final int workerId;
         private volatile boolean active = true;
 
         public ConsumerWorker(jakarta.jms.Connection jmsConn, String queueName, 
                             SourceCallback<Object, MessageAttributes> callback,
-                            int sessionAckMode, String selector, int workerId) {
+                            int sessionAckMode, int workerId) {
             this.jmsConn = jmsConn;
             this.queueName = queueName;
             this.callback = callback;
             this.sessionAckMode = sessionAckMode;
-            this.selector = selector;
+            //this.selector = selector;
             this.workerId = workerId;
         }
 
@@ -301,13 +300,13 @@ public class SapAmqpConnectorMessageSource extends Source<Object, MessageAttribu
                 session = jmsConn.createSession(false, sessionAckMode);
                 Destination queue = session.createQueue(queueName);
                 
-                if (selector != null && !selector.trim().isEmpty()) {
-                    consumer = session.createConsumer(queue, selector);
-                    LOGGER.info("Consumer #{} - Created with selector: {}", workerId, selector);
-                } else {
-                    consumer = session.createConsumer(queue);
-                    LOGGER.info("Consumer #{} - Created without selector", workerId);
-                }
+//                if (selector != null && !selector.trim().isEmpty()) {
+//                    consumer = session.createConsumer(queue, selector);
+//                    LOGGER.info("Consumer #{} - Created with selector: {}", workerId, selector);
+//                } else {
+//                    consumer = session.createConsumer(queue);
+//                    LOGGER.info("Consumer #{} - Created without selector", workerId);
+//                }
 
                 LOGGER.info("Consumer #{} ready and listening (AUTO mode)...", workerId);
 
@@ -362,12 +361,12 @@ public class SapAmqpConnectorMessageSource extends Source<Object, MessageAttribu
                     dedicatedSession = jmsConn.createSession(false, sessionAckMode);
                     Destination queue = dedicatedSession.createQueue(queueName);
                     
-                    if (selector != null && !selector.trim().isEmpty()) {
-                        dedicatedConsumer = dedicatedSession.createConsumer(queue, selector);
-                    } else {
-                        dedicatedConsumer = dedicatedSession.createConsumer(queue);
-                    }
-                    
+//                    if (selector != null && !selector.trim().isEmpty()) {
+//                        dedicatedConsumer = dedicatedSession.createConsumer(queue, selector);
+//                    } else {
+//                        dedicatedConsumer = dedicatedSession.createConsumer(queue);
+//                    }
+//                    
                     // Receive message with timeout
                     Message message = dedicatedConsumer.receive(1000);
                     
