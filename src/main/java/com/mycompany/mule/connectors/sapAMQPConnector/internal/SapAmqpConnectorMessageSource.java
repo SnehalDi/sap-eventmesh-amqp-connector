@@ -468,26 +468,44 @@ public class SapAmqpConnectorMessageSource extends Source<Object, MessageAttribu
 
         /**
          * Process message in CLIENT mode
-         * Registers message with AcknowledgmentRegistry for manual acknowledgment
+         * Registers message with AcknowledgmentRegistry for manual acknowledgment using JMS Message ID
          * Session is kept open until message is acknowledged
          */
-        private void processMessageClientMode(Message message, Session dedicatedSession) 
-                throws InterruptedException {
+        /**
+         * Process message in CLIENT mode
+         * Registers message with AcknowledgmentRegistry for manual acknowledgment using JMS Correlation ID
+         * Session is kept open until message is acknowledged
+         */
+        private void processMessageClientMode(Message message, Session dedicatedSession) throws InterruptedException {
             String ackId = null;
-            
             try {
-                LOGGER.debug("Consumer #{} - Message received (CLIENT mode)", workerId);
-
+                LOGGER.debug("[Consumer-{}] Message received (CLIENT mode)", workerId);
+                
                 byte[] payloadBytes = extractPayloadAsBytes(message);
                 MessageAttributes attributes = extractMessageAttributes(message);
                 
-                // Register message for acknowledgment with its dedicated session
-                ackId = SapAmqpConnectorOperations.AcknowledgmentRegistry
-                    .getInstance().registerMessage(message, dedicatedSession);
-                attributes.setackId(ackId);
-                attributes.setRequiresAcknowledgment(true);
-                
-                LOGGER.debug("Consumer #{} - Registered for acknowledgment: {}", workerId, ackId);
+                // Register message for acknowledgment with its dedicated session using JMS Correlation ID
+                try {
+                    ackId = SapAmqpConnectorOperations.AcknowledgmentRegistry
+                        .getInstance().registerMessage(message, dedicatedSession);
+                    attributes.setackId(ackId);
+                    attributes.setRequiresAcknowledgment(true);
+                    
+                    LOGGER.debug("[Consumer-{}] Registered for acknowledgment with Correlation ID: {}", workerId, ackId);
+                } catch (JMSException e) {
+                    LOGGER.error("[Consumer-{}] Failed to register message for acknowledgment: {}", workerId, e.getMessage());
+                    LOGGER.error("[Consumer-{}] Ensure the publisher sets JMSCorrelationID on the message", workerId);
+                    // Close session and rethrow
+                    try {
+                        if (dedicatedSession != null) {
+                            dedicatedSession.close();
+                        }
+                    } catch (Exception closeEx) {
+                        LOGGER.debug("[Consumer-{}] Error closing session: {}", workerId, closeEx.getMessage());
+                    }
+                    throw new RuntimeException("Failed to register message for acknowledgment: " + e.getMessage() + 
+                                             ". Ensure the publisher sets a correlation ID.", e);
+                }
                 
                 String contentType = attributes.getContentType();
                 org.mule.runtime.api.metadata.MediaType outputMediaType;
@@ -496,36 +514,35 @@ public class SapAmqpConnectorMessageSource extends Source<Object, MessageAttribu
                     try {
                         outputMediaType = org.mule.runtime.api.metadata.MediaType.parse(contentType);
                     } catch (Exception e) {
-                        LOGGER.warn("Consumer #{} - Invalid content-type, using ANY", workerId);
+                        LOGGER.warn("[Consumer-{}] Invalid content-type, using ANY", workerId);
                         outputMediaType = org.mule.runtime.api.metadata.MediaType.ANY;
                     }
                 } else {
                     outputMediaType = org.mule.runtime.api.metadata.MediaType.ANY;
                 }
                 
-                LOGGER.info("Consumer #{} - Processing message [ID: {}, Size: {} bytes, Mode: CLIENT]", 
-                    workerId, attributes.getMessageId(), payloadBytes.length);
+                LOGGER.info("[Consumer-{}] Processing message (Correlation ID: {}), Size: {} bytes, Mode: CLIENT", 
+                    workerId, ackId, payloadBytes.length);
                 
                 Object outputPayload = parsePayload(payloadBytes, outputMediaType);
                 
                 Result<Object, MessageAttributes> result = Result.<Object, MessageAttributes>builder()
-                    .output(outputPayload)
-                    .attributes(attributes)
-                    .mediaType(outputMediaType)
-                    .build();
-
+                        .output(outputPayload)
+                        .attributes(attributes)
+                        .mediaType(outputMediaType)
+                        .build();
+                
                 callback.handle(result);
                 
-                LOGGER.info("Consumer #{} - Message delivered to flow (awaiting acknowledgment)", workerId);
-                LOGGER.warn("Consumer #{} - Message MUST be acknowledged using ackId: {}", 
-                    workerId, ackId);
-
+                LOGGER.info("[Consumer-{}] Message delivered to flow (awaiting acknowledgment)", workerId);
+                LOGGER.warn("[Consumer-{}] Message MUST be acknowledged using Correlation ID: {}", workerId, ackId);
+                
             } catch (Exception e) {
-                LOGGER.error("Consumer #{} - Error processing message", workerId, e);
+                LOGGER.error("[Consumer-{}] Error processing message", workerId, e);
                 
                 // Clean up acknowledgment registration if processing failed
                 if (ackId != null) {
-                    LOGGER.warn("Consumer #{} - Removing acknowledgment due to error", workerId);
+                    LOGGER.warn("[Consumer-{}] Removing acknowledgment due to error", workerId);
                     SapAmqpConnectorOperations.AcknowledgmentRegistry
                         .getInstance().removePendingAcknowledgment(ackId);
                 }
@@ -534,17 +551,17 @@ public class SapAmqpConnectorMessageSource extends Source<Object, MessageAttribu
                 try {
                     if (dedicatedSession != null) {
                         dedicatedSession.close();
-                        LOGGER.debug("Consumer #{} - Closed session after error", workerId);
+                        LOGGER.debug("[Consumer-{}] Closed session after error", workerId);
                     }
                 } catch (Exception closeEx) {
-                    LOGGER.debug("Consumer #{} - Error closing session: {}", 
-                        workerId, closeEx.getMessage());
+                    LOGGER.debug("[Consumer-{}] Error closing session: {}", workerId, closeEx.getMessage());
                 }
                 
-                LOGGER.warn("Consumer #{} - Message NOT acknowledged - will be redelivered by broker", 
-                    workerId);
+                LOGGER.warn("[Consumer-{}] Message NOT acknowledged - will be redelivered by broker", workerId);
             }
         }
+
+        
         /**
          * Extract payload as byte array from JMS message
          */

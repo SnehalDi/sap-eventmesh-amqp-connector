@@ -16,10 +16,10 @@ import org.mule.runtime.api.metadata.DataType;
 import org.mule.runtime.extension.api.annotation.metadata.OutputResolver;
 
 import jakarta.jms.*;
-import org.apache.qpid.proton.amqp.Symbol;
 import org.apache.qpid.jms.message.JmsMessage; 
 import org.apache.qpid.jms.provider.amqp.message.AmqpJmsMessageFacade;
 import org.apache.qpid.jms.JmsConnectionFactory;
+import org.apache.qpid.proton.amqp.Symbol;
 import org.mule.runtime.api.connection.ConnectionException;
 
 import org.slf4j.Logger;
@@ -61,6 +61,7 @@ public class SapAmqpConnectorOperations {
             @DisplayName("Queue Name") @Summary("Name of the queue to publish to") String queueName,
             @Content @DisplayName("Message Payload") TypedValue<Object> payload,
             @Optional @DisplayName("Content Type") @Summary("Override content type (uses payload's type if not specified)") String contentType,
+            @Optional @DisplayName("Correlation Id") @Summary("Override correlationId") String correlationId,
             @Optional @DisplayName("Headers") @Summary("Custom headers to add to the message") 
             @NullSafe List<MessageHeader> headers) throws ConnectionException {
 
@@ -101,15 +102,24 @@ public class SapAmqpConnectorOperations {
             BytesMessage msg = session.createBytesMessage();
             msg.writeBytes(messageBytes);
 
-            // Set AMQP content-type via facade
+            // Set AMQP content-type via facade using Symbol
             if (msg instanceof JmsMessage) {
                 JmsMessage jmsMessage = (JmsMessage) msg;
                 if (jmsMessage.getFacade() instanceof AmqpJmsMessageFacade) {
                     AmqpJmsMessageFacade facade = (AmqpJmsMessageFacade) jmsMessage.getFacade();
                     facade.setContentType(Symbol.valueOf(mimeType));
                     LOGGER.debug("AMQP facade content-type set to: {}", mimeType);
+                    
+                   
+                    
+                    // Set AMQP Correlation ID (if provided)
+                    if (correlationId != null && !correlationId.trim().isEmpty()) {
+                        facade.setCorrelationId(correlationId);  // AMQP uses String for correlation-id
+                        LOGGER.info("AMQP facade correlation-id set to: {}", correlationId);
+                    }
                 }
             }
+
 
             // Keep backward compatibility with JMS property
             msg.setStringProperty(JMS_AMQP_CONTENT_TYPE, mimeType);
@@ -185,16 +195,31 @@ public class SapAmqpConnectorOperations {
             byte[] payloadBytes = extractPayloadAsBytes(message);
             MessageAttributes attributes = extractMessageAttributes(message);
             
-            // Handle CLIENT mode - register for acknowledgment
+         // Handle CLIENT mode - register for acknowledgment using JMS Correlation ID
             if (isClientMode) {
-                // Keep session open for acknowledgment
-                String ackId = AcknowledgmentRegistry.getInstance()
-                    .registerMessage(message, session);
-                attributes.setackId(ackId);
-                attributes.setRequiresAcknowledgment(true);
-                
-                LOGGER.debug("CLIENT mode: Message registered for acknowledgment with ID: {}", ackId);
-                LOGGER.warn("Message must be explicitly acknowledged using 'Acknowledge Message' operation");
+                try {
+                    String ackId = AcknowledgmentRegistry.getInstance()
+                        .registerMessage(message, session);
+                    attributes.setackId(ackId);
+                    attributes.setRequiresAcknowledgment(true);
+                    
+                    LOGGER.debug("CLIENT mode: Message registered for acknowledgment with Correlation ID: {}", ackId);
+                    LOGGER.warn("Message must be explicitly acknowledged using 'Acknowledge Message' operation with Correlation ID: {}", ackId);
+                } catch (JMSException e) {
+                    LOGGER.error("Failed to register message for acknowledgment: {}", e.getMessage());
+                    LOGGER.error("Ensure the publisher sets JMSCorrelationID on the message");
+                    // Clean up session since we couldn't register
+                    if (session != null) {
+                        try {
+                            session.close();
+                        } catch (Exception closeEx) {
+                            LOGGER.error("Error closing session after registration failure", closeEx);
+                        }
+                    }
+                    return buildErrorResult("REGISTRATION_ERROR", 
+                        "Failed to register message for acknowledgment: " + e.getMessage() + 
+                        ". Ensure the publisher sets a correlation ID on the message.");
+                }
             } else {
                 attributes.setRequiresAcknowledgment(false);
                 LOGGER.info("AUTO mode: Message automatically acknowledged");
@@ -273,17 +298,17 @@ public class SapAmqpConnectorOperations {
     @MediaType(value = ANY, strict = false)
     public void acknowledgeMessage(
             @DisplayName("Acknowledgment ID")
-            @Summary("The acknowledgment ID from the message attributes")
+            @Summary("The JMS Correlation ID from the message attributes")
             String ackId,
             
             @Connection
             SapAmqpConnectorConnection connection) {
         
         LOGGER.info("=== Acknowledging Message ===");
-        LOGGER.debug("Acknowledgment ID: {}", ackId);
+        LOGGER.debug("Acknowledgment ID (JMS Correlation ID): {}", ackId);
         
         if (ackId == null || ackId.trim().isEmpty()) {
-            String errorMsg = "Acknowledgment ID is required";
+            String errorMsg = "Acknowledgment ID (JMS Correlation ID) is required";
             LOGGER.error(errorMsg);
             throw new RuntimeException(errorMsg);
         }
@@ -292,7 +317,7 @@ public class SapAmqpConnectorOperations {
         AcknowledgmentRegistry.PendingAcknowledgment pending = registry.getPendingAcknowledgment(ackId);
         
         if (pending == null) {
-            String errorMsg = "No pending acknowledgment found for ID: " + ackId + 
+            String errorMsg = "No pending acknowledgment found for Correlation ID: " + ackId + 
                              ". It may have already been acknowledged or timed out.";
             LOGGER.error(errorMsg);
             throw new RuntimeException(errorMsg);
@@ -303,6 +328,7 @@ public class SapAmqpConnectorOperations {
             Session session = pending.getSession();
             
             LOGGER.debug("Pending acknowledgment age: {} seconds", pending.getAgeInSeconds());
+            LOGGER.debug("Message Correlation ID: {}", message.getJMSCorrelationID());
             LOGGER.debug("Message ID: {}", message.getJMSMessageID());
             
             try {
@@ -335,7 +361,6 @@ public class SapAmqpConnectorOperations {
             throw new RuntimeException(errorMsg, e);
         }
     }
-
     // ========================================================================
     // HELPER METHODS
     // ========================================================================
@@ -815,7 +840,7 @@ public class SapAmqpConnectorOperations {
     // ========================================================================
     
     /**
-     * Registry for managing pending message acknowledgments
+     * Registry for managing pending message acknowledgments using JMS Message ID
      */
     public static class AcknowledgmentRegistry {
         
@@ -835,12 +860,40 @@ public class SapAmqpConnectorOperations {
             return INSTANCE;
         }
         
-        public String registerMessage(Message message, Session session) {
-            String ackId = java.util.UUID.randomUUID().toString();
+        /**
+         * Register a message for acknowledgment using its JMS Correlation ID
+         * @param message The JMS message to register
+         * @param session The session associated with the message
+         * @return The JMS Correlation ID to use for acknowledgment
+         * @throws JMSException if the message has no Correlation ID
+         */
+        public String registerMessage(Message message, Session session) throws JMSException {
+            String ackId = message.getJMSCorrelationID();
+            
+            if (ackId == null || ackId.trim().isEmpty()) {
+                throw new JMSException("Message has no JMS Correlation ID - cannot register for acknowledgment. " +
+                                      "Ensure the publisher sets a correlation ID on the message.");
+            }
+            
+            // Check if this correlation ID is already registered
+            if (pendingAcks.containsKey(ackId)) {
+                LOGGER.warn("Correlation ID {} is already registered. Replacing with new registration.", ackId);
+                // Clean up old registration
+                PendingAcknowledgment old = pendingAcks.get(ackId);
+                if (old != null && old.getSession() != null) {
+                    try {
+                        old.getSession().close();
+                        LOGGER.debug("Closed previous session for duplicate correlation ID: {}", ackId);
+                    } catch (Exception e) {
+                        LOGGER.warn("Error closing previous session: {}", e.getMessage());
+                    }
+                }
+            }
+            
             PendingAcknowledgment pending = new PendingAcknowledgment(message, session);
             pendingAcks.put(ackId, pending);
             
-            LOGGER.debug("Registered message for acknowledgment with ID: {}", ackId);
+            LOGGER.debug("Registered message for acknowledgment with Correlation ID: {}", ackId);
             LOGGER.debug("Total pending acknowledgments: {}", pendingAcks.size());
             
             return ackId;
